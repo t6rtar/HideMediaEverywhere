@@ -528,6 +528,23 @@ function addCurtain(cover: HTMLElement, reveal: RevealSource, dims?: Placeholder
 
     cover.classList.add(CURTAIN_COVER_CLASS);
 
+    const size = dims ?? (reveal.nw && reveal.nh ? fitSize(reveal.nw, reveal.nh) : { w: 200, h: 150 });
+    wrapper.style.width = `${size.w}px`;
+    wrapper.style.height = `${size.h}px`;
+    cover.style.position = "absolute";
+    cover.style.inset = "0";
+    cover.style.width = "100%";
+    cover.style.height = "100%";
+    cover.style.boxSizing = "border-box";
+    cover.style.objectFit = "cover";
+
+    if (cover instanceof HTMLDivElement) {
+        cover.style.display = "flex";
+        cover.style.alignItems = "center";
+        cover.style.justifyContent = "center";
+        cover.style.background = "var(--background-secondary)";
+    }
+
     const handle = document.createElement("div");
     handle.className = CURTAIN_HANDLE_CLASS;
 
@@ -540,16 +557,7 @@ function addCurtain(cover: HTMLElement, reveal: RevealSource, dims?: Placeholder
     let height   = 0;
     let dragging = false;
 
-    if (dims) {
-        wrapper.style.width   = `${dims.w}px`;
-        wrapper.style.height  = `${dims.h}px`;
-        cover.style.position  = "absolute";
-        cover.style.inset     = "0";
-        cover.style.width     = "100%";
-        cover.style.height    = "100%";
-        cover.style.objectFit = "cover";
-        height = dims.h;
-    }
+    height = size.h;
 
     const HANDLE_H = 18;
     let atBottomState: boolean | null = null;
