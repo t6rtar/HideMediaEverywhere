@@ -1,0 +1,13 @@
+{
+  "name": "Hide Media Everywhere",
+  "description": "Hide selected Discord attachments on Kettu.",
+  "authors": [
+    {
+      "name": "t6rtar",
+      "id": "738215409559404562"
+    }
+  ],
+  "version": "0.6.0",
+  "hash": "1fac5cfd786403b7ee78379cf3375129fd20f6b50d30676e867fff083099c9e5",
+  "main": "index.js"
+}
