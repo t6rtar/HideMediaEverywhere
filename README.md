@@ -1,13 +1,20 @@
 # HideMediaEverywhere
 
-A Vencord userplugin for hiding specific images, GIFs, and videos in Discord.
+A Vencord userplugin that lets you hide specific images, GIFs, and videos in Discord.
 
-Right-click media and choose **Hide this media**. Hidden media is replaced with a placeholder, which you can drag down to peek at the original.
+Instead of removing the message, blocked media is replaced with a placeholder. Right-click a message and select **Hide this media** to hide it everywhere it appears.
 
-## Install
+## Installation
 
-1. Create `Vencord/src/userplugins/HideMediaEverywhere`.
-2. Put [`index.tsx`](./index.tsx) inside it.
-3. Build Vencord and restart Discord or Vesktop.
-4. Enable **HideMediaEverywhere** in Vencord settings.
+1. Clone this repository into `src/userplugins/HideMediaEverywhere` inside your Vencord checkout.
+2. Build Vencord.
+3. Enable **HideMediaEverywhere** in Vencord's plugin settings.
 
+Hidden media stays blocked across chats, search results, previews, and the GIF picker.
+
+## Settings
+
+- **Drag to peek:** Drag the placeholder down to reveal the hidden media.
+- **Autoplay GIFs:** Automatically play GIFs while they are revealed.
+- **Do not hide my images:** Keep images you send visible.
+- **Placeholder image:** Choose a custom image to display over hidden media.
