@@ -5,9 +5,6 @@
   const storage = vendetta.plugin.storage;
   const logger = vendetta.logger;
   let unpatchRowData = null;
-  let unpatchActionSheets = [];
-  let unpatchSheetRenderers = [];
-  let patchedSheetModules = new WeakSet();
 
   function keysOf(value) {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return [];
@@ -26,15 +23,108 @@
     return undefined;
   }
 
-  function findAllByProps(props) {
-    if (typeof metro.findByPropsAll === "function") {
-      try {
-        const matches = metro.findByPropsAll(...props);
-        if (Array.isArray(matches)) return matches.filter(Boolean);
-      } catch { }
+  function unwrapModule(record) {
+    return record?.publicModule?.exports ?? record?.exports ?? record;
+  }
+
+  function functionSource(value) {
+    if (typeof value !== "function") return "";
+    try {
+      return Function.prototype.toString.call(value);
+    } catch {
+      return "";
     }
-    const match = findByProps(props);
-    return match ? [match] : [];
+  }
+
+  function sourceMatchSnippet(source, pattern) {
+    const match = pattern.exec(source);
+    pattern.lastIndex = 0;
+    if (!match) return "";
+    const start = Math.max(0, match.index - 90);
+    const end = Math.min(source.length, match.index + match[0].length + 150);
+    return source.slice(start, end).replace(/\s+/g, " ");
+  }
+
+  function scanMenuModules() {
+    const pattern = /MessageLongPressActionSheet|MessageLongPress|MessagesHandlers|DCDChat|ActionSheetRow|showSimpleActionSheet|openLazy|context.?menu/gi;
+    const lines = [
+      `menu discovery ${new Date().toISOString()}`,
+      `metroKeys=${keysOf(metro).sort().join(",")}`,
+      "name probes:"
+    ];
+    const names = ["MessageLongPressActionSheet", "MessagesHandlers", "DCDChat", "ActionSheetRow"];
+    for (const name of names) {
+      for (const method of ["findByNameAll", "findByDisplayNameAll", "findByTypeNameAll"]) {
+        if (typeof metro[method] !== "function") continue;
+        try {
+          const matches = metro[method](name);
+          const list = Array.isArray(matches) ? matches : matches ? [matches] : [];
+          lines.push(`${method}(${name})=${list.length}${list.length ? ` [${list.slice(0, 8).map((value) => keysOf(value).join("|") || typeof value).join("; ")}]` : ""}`);
+        } catch (error) {
+          lines.push(`${method}(${name})=ERROR ${String(error)}`);
+        }
+      }
+    }
+
+    lines.push("registry matches:");
+    let scanned = 0;
+    let matched = 0;
+    try {
+      for (const [id, record] of Object.entries(metro.modules || {})) {
+        scanned++;
+        const exports = unwrapModule(record);
+        const candidates = [["<exports>", exports], ["default", exports?.default]];
+        for (const key of keysOf(exports).slice(0, 160)) {
+          let value;
+          try {
+            value = exports[key];
+          } catch {
+            continue;
+          }
+          candidates.push([key, value]);
+        }
+        for (const key of keysOf(record).slice(0, 40)) {
+          let value;
+          try {
+            value = record[key];
+          } catch {
+            continue;
+          }
+          if (typeof value === "function") candidates.push([`record.${key}`, value]);
+        }
+
+        const moduleLines = [];
+        const seen = new Set();
+        for (const [key, value] of candidates) {
+          if (!value || seen.has(value)) continue;
+          seen.add(value);
+          const display = typeof value === "function"
+            ? value.displayName || value.name || "anonymous"
+            : value?.displayName || value?.name || value?.render?.displayName || value?.render?.name || "";
+          const source = functionSource(value) || functionSource(value?.render);
+          pattern.lastIndex = 0;
+          const keyText = `${key} ${display} ${keysOf(value).join(" ")}`;
+          const keyHit = pattern.test(keyText);
+          pattern.lastIndex = 0;
+          const snippet = sourceMatchSnippet(source, pattern);
+          if (!keyHit && !snippet) continue;
+          moduleLines.push(`${key}: type=${typeof value} name=${display || "<none>"} keys=${keysOf(value).slice(0, 50).join(",") || "<none>"}${snippet ? ` source=${snippet}` : ""}`);
+        }
+        if (!moduleLines.length) continue;
+        lines.push(`${id}: exports=${keysOf(exports).slice(0, 100).join(",") || "<none>"}`);
+        lines.push(...moduleLines.slice(0, 12).map((line) => `  ${line}`));
+        matched++;
+        if (matched >= 100) {
+          lines.push("<registry report capped at 100 modules>");
+          break;
+        }
+      }
+    } catch (error) {
+      lines.push(`registry scan error=${String(error)}`);
+    }
+    lines.push(`scanned=${scanned} matched=${matched}`);
+    storage.menuDiscoveryReport = lines.join("\n");
+    return storage.menuDiscoveryReport;
   }
 
   function filenameFromUrl(url) {
@@ -66,20 +156,9 @@
     return attachmentKey("*", filename);
   }
 
-  function isGifAttachment(attachment) {
-    const filename = attachmentFilename(attachment).toLowerCase();
-    const contentType = String(attachment?.content_type || attachment?.original_content_type || "").toLowerCase();
-    const urls = [attachment?.url, attachment?.proxy_url, attachment?.videoUrl].filter((value) => typeof value === "string");
-    return attachment?.srcIsAnimated === true
-      || contentType === "image/gif"
-      || filename.endsWith(".gif")
-      || urls.some((url) => /(?:tenor|giphy)\.com/i.test(url));
-  }
-
-  function attachmentBlockKey(authorId, attachment) {
-    const filename = attachmentFilename(attachment);
-    if (!filename) return "";
-    return isGifAttachment(attachment) ? globalAttachmentKey(filename) : attachmentKey(authorId, filename);
+  function normalizeBlockedKey(key) {
+    const colon = key.indexOf(":");
+    return colon === -1 ? globalAttachmentKey(key) : globalAttachmentKey(key.slice(colon + 1));
   }
 
   function readBlocked() {
@@ -88,6 +167,7 @@
         .split("\n")
         .map((value) => value.trim())
         .filter(Boolean)
+        .map(normalizeBlockedKey)
     );
   }
 
@@ -112,178 +192,21 @@
     for (const attachment of attachments) {
       const filename = attachmentFilename(attachment);
       if (!filename) continue;
-      const key = attachmentBlockKey(authorId, attachment);
+      const key = attachmentKey(authorId, filename);
       const oldIndex = recent.findIndex((item) => item.key === key);
       if (oldIndex !== -1) recent.splice(oldIndex, 1);
-      recent.unshift({ key, filename, authorId, kind: isGifAttachment(attachment) ? "gif" : "media" });
+      recent.unshift({ key, filename, authorId });
     }
     storage.recentAttachments = JSON.stringify(recent.slice(0, 30));
   }
 
-  function attachmentMatchLines(label, attachments, blocked, authorId) {
+  function attachmentMatchLines(label, attachments, blocked) {
     if (!Array.isArray(attachments)) return [`${label}: not an array`];
     if (attachments.length === 0) return [`${label}: empty`];
     return attachments.map((attachment, index) => {
       const filename = attachmentFilename(attachment) || "<no filename>";
-      const key = filename === "<no filename>" ? "<none>" : attachmentBlockKey(authorId, attachment);
+      const key = filename === "<no filename>" ? "<none>" : globalAttachmentKey(filename);
       return `${label}[${index}]: filename=${filename} key=${key} selected=${blocked.has(key)}`;
-    });
-  }
-
-  function findMessagePaths(value, path, depth, seen, output) {
-    if (!value || depth > 4 || (typeof value !== "object" && typeof value !== "function")) return;
-    if (seen.has(value)) return;
-    seen.add(value);
-
-    if (!Array.isArray(value) && (Array.isArray(value.attachments) || Array.isArray(value.embeds))) {
-      output.push(
-        `${path}: attachments=${Array.isArray(value.attachments) ? value.attachments.length : "n/a"} embeds=${Array.isArray(value.embeds) ? value.embeds.length : "n/a"} keys=${keysOf(value).slice(0, 30).join(",")}`
-      );
-    }
-
-    if (Array.isArray(value)) {
-      for (let index = 0; index < Math.min(value.length, 12); index++) {
-        findMessagePaths(value[index], `${path}[${index}]`, depth + 1, seen, output);
-      }
-      return;
-    }
-
-    for (const key of keysOf(value).slice(0, 60)) {
-      let child;
-      try {
-        child = value[key];
-      } catch {
-        continue;
-      }
-      findMessagePaths(child, `${path}.${key}`, depth + 1, seen, output);
-      if (output.length >= 30) return;
-    }
-  }
-
-  function describeActionSheet(method, args) {
-    const config = args?.[0];
-    const options = Array.isArray(config?.options) ? config.options : [];
-    const messagePaths = [];
-    findMessagePaths(args, "args", 0, new Set(), messagePaths);
-    return [
-      `action sheet ${new Date().toISOString()}`,
-      `method=${method}`,
-      `argCount=${Array.isArray(args) ? args.length : "n/a"}`,
-      ...Array.from({ length: Math.min(args?.length || 0, 5) }, (_, index) =>
-        `arg[${index}]: type=${Array.isArray(args[index]) ? "array" : typeof args[index]} value=${typeof args[index] === "string" ? args[index] : "<non-string>"} keys=${keysOf(args[index]).slice(0, 60).join(",") || "<none>"}`
-      ),
-      `key=${typeof config?.key === "string" ? config.key : "<none>"}`,
-      `configKeys=${keysOf(config).join(", ") || "<none>"}`,
-      `headerKeys=${keysOf(config?.header).join(", ") || "<none>"}`,
-      `optionCount=${options.length}`,
-      ...options.slice(0, 30).map((option, index) => `option[${index}]: label=${String(option?.label ?? "<none>")} keys=${keysOf(option).join(",")}`),
-      "message-like paths:",
-      ...(messagePaths.length ? messagePaths : ["<none>"])
-    ].join("\n");
-  }
-
-  function saveActionSheetCapture(method, args) {
-    const captures = (() => {
-      try {
-        const parsed = JSON.parse(storage.actionSheetReports || "[]");
-        return Array.isArray(parsed) ? parsed : [];
-      } catch {
-        return [];
-      }
-    })();
-    captures.unshift(describeActionSheet(method, args));
-    storage.actionSheetReports = JSON.stringify(captures.slice(0, 8));
-    storage.actionSheetCaptureCount = (storage.actionSheetCaptureCount || 0) + 1;
-  }
-
-  function readActionSheetReports() {
-    try {
-      const parsed = JSON.parse(storage.actionSheetReports || "[]");
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-
-  function elementTypeName(type) {
-    if (typeof type === "string") return type;
-    if (typeof type === "function") return type.displayName || type.name || "anonymous function";
-    if (typeof type === "symbol") return String(type);
-    if (type && typeof type === "object") {
-      return type.displayName || type.name || type.render?.displayName || type.render?.name || `object(${keysOf(type).join(",")})`;
-    }
-    return String(type);
-  }
-
-  function describeElementTree(root) {
-    const lines = [];
-    const seen = new Set();
-    function walk(node, path, depth) {
-      if (lines.length >= 180 || depth > 9 || node === null || node === undefined || typeof node === "boolean") return;
-      if (Array.isArray(node)) {
-        lines.push(`${path}: array(${node.length})`);
-        for (let index = 0; index < Math.min(node.length, 40); index++) walk(node[index], `${path}[${index}]`, depth + 1);
-        return;
-      }
-      if (typeof node !== "object") {
-        lines.push(`${path}: ${typeof node}=${String(node).slice(0, 100)}`);
-        return;
-      }
-      if (seen.has(node)) {
-        lines.push(`${path}: <seen>`);
-        return;
-      }
-      seen.add(node);
-      const props = node.props;
-      const summaries = ["label", "title", "text", "name"].flatMap((key) => {
-        const value = props?.[key];
-        return typeof value === "string" ? [`${key}=${JSON.stringify(value.slice(0, 100))}`] : [];
-      });
-      lines.push(`${path}: type=${elementTypeName(node.type)} keys=${keysOf(node).join(",") || "<none>"} props=${keysOf(props).slice(0, 80).join(",") || "<none>"}${summaries.length ? ` ${summaries.join(" ")}` : ""}`);
-      if (props && Object.prototype.hasOwnProperty.call(props, "children")) walk(props.children, `${path}.children`, depth + 1);
-    }
-    walk(root, "result", 0);
-    return lines.join("\n") || "<empty render result>";
-  }
-
-  function patchMessageSheetImporter(args) {
-    if (args?.[1] !== "MessageLongPressActionSheet") return;
-    const importer = args[0];
-    args[0] = Promise.resolve(importer).then((module) => {
-      try {
-        storage.messageSheetModuleReport = [
-          `resolved ${new Date().toISOString()}`,
-          `moduleType=${typeof module}`,
-          `moduleKeys=${keysOf(module).join(",") || "<none>"}`,
-          `defaultType=${typeof module?.default}`,
-          `defaultKeys=${keysOf(module?.default).join(",") || "<none>"}`,
-          `defaultName=${elementTypeName(module?.default)}`
-        ].join("\n");
-        if (!module || (typeof module !== "object" && typeof module !== "function") || patchedSheetModules.has(module)) return module;
-        patchedSheetModules.add(module);
-        let target = module;
-        let method = "default";
-        if (typeof module.default !== "function" && typeof module.default?.render === "function") {
-          target = module.default;
-          method = "render";
-        }
-        if (typeof target?.[method] !== "function") {
-          storage.messageSheetRenderStatus = `No patchable renderer. ${method} is ${typeof target?.[method]}.`;
-          return module;
-        }
-        unpatchSheetRenderers.push(vendetta.patcher.after(method, target, (_renderArgs, result) => {
-          try {
-            storage.messageSheetRenderCount = (storage.messageSheetRenderCount || 0) + 1;
-            storage.messageSheetRenderReport = describeElementTree(result);
-          } catch (error) {
-            storage.messageSheetRenderStatus = `Render capture error: ${String(error)}`;
-          }
-        }));
-        storage.messageSheetRenderStatus = `Observing resolved ${method} renderer without changing it.`;
-      } catch (error) {
-        storage.messageSheetRenderStatus = `Renderer patch error: ${String(error)}`;
-      }
-      return module;
     });
   }
 
@@ -302,10 +225,10 @@
     return clone;
   }
 
-  function shouldHideAttachment(attachment, blocked, authorId) {
+  function shouldHideAttachment(attachment, blocked) {
     if (storage.hideAllAttachments) return true;
-    const key = attachmentBlockKey(authorId, attachment);
-    return !!key && blocked.has(key);
+    const filename = attachmentFilename(attachment);
+    return !!filename && blocked.has(globalAttachmentKey(filename));
   }
 
   function installPatch() {
@@ -324,7 +247,6 @@
       try {
         const sourceMessage = args?.[0]?.message;
         const blocked = readBlocked();
-        const authorId = authorIdFrom(sourceMessage);
         rememberAttachments(sourceMessage, sourceMessage?.attachments);
         const sourceAttachments = sourceMessage?.attachments;
         if (Array.isArray(sourceAttachments) && sourceAttachments.length > 0) {
@@ -333,17 +255,17 @@
             `match ${new Date().toISOString()}`,
             "postGenerationReplacement=true",
             `blockedKeys=${[...blocked].join(", ") || "<none>"}`,
-            ...attachmentMatchLines("source", sourceAttachments, blocked, authorId)
+            ...attachmentMatchLines("source", sourceAttachments, blocked)
           ].join("\n");
         }
         const rowAttachments = result?.message?.attachments;
         rememberAttachments(sourceMessage, rowAttachments);
         if (Array.isArray(rowAttachments) && rowAttachments.length > 0) {
-          const visible = rowAttachments.filter((attachment) => !shouldHideAttachment(attachment, blocked, authorId));
+          const visible = rowAttachments.filter((attachment) => !shouldHideAttachment(attachment, blocked));
           const removed = rowAttachments.length - visible.length;
           storage.latestMatchReport = [
             storage.latestMatchReport || `match ${new Date().toISOString()}`,
-            ...attachmentMatchLines("result", rowAttachments, blocked || new Set(), authorId),
+            ...attachmentMatchLines("result", rowAttachments, blocked || new Set()),
             `hideAllAttachments=${!!storage.hideAllAttachments}`,
             `replacementRemoved=${removed}`
           ].join("\n");
@@ -368,52 +290,9 @@
     logger.log("[HideMediaEverywhere]", storage.patchStatus);
   }
 
-  function installActionSheetProbe() {
-    if (typeof vendetta.patcher?.before !== "function") {
-      storage.actionSheetProbeStatus = `patcher.before unavailable. Keys: ${keysOf(vendetta.patcher).join(", ") || "<none>"}`;
-      return;
-    }
-
-    const targetGroups = [
-      [findAllByProps(["showSimpleActionSheet"]), "showSimpleActionSheet"],
-      [findAllByProps(["openLazy", "hideActionSheet"]), "openLazy"]
-    ];
-    const targets = [];
-    const seenTargets = new Set();
-    for (const [modules, method] of targetGroups) {
-      for (const module of modules) {
-        if (!module || typeof module[method] !== "function") continue;
-        const identity = module[method];
-        if (seenTargets.has(identity)) continue;
-        seenTargets.add(identity);
-        targets.push([module, method]);
-      }
-    }
-    const installed = [];
-    for (const [module, method] of targets) {
-      if (!module || typeof module[method] !== "function") continue;
-      try {
-        unpatchActionSheets.push(vendetta.patcher.before(method, module, (args) => {
-          try {
-            saveActionSheetCapture(method, args);
-            if (method === "openLazy") patchMessageSheetImporter(args);
-          } catch (error) {
-            storage.actionSheetProbeError = `${method} capture error: ${String(error)}`;
-          }
-        }));
-        installed.push(`${method}#${installed.filter((name) => name.startsWith(method)).length + 1}`);
-      } catch (error) {
-        storage.actionSheetProbeError = `${method} patch error: ${String(error)}`;
-      }
-    }
-    storage.actionSheetProbeStatus = installed.length
-      ? `Observing ${installed.join(" + ")} without changing them. Candidates: simple=${targetGroups[0][0].length}, lazy=${targetGroups[1][0].length}.`
-      : "No compatible action-sheet entry point was found.";
-  }
-
   function toggleRecent(item) {
     const blocked = readBlocked();
-    const key = item.key;
+    const key = globalAttachmentKey(item.filename);
     if (blocked.has(key)) blocked.delete(key);
     else blocked.add(key);
     writeBlocked(blocked);
@@ -482,7 +361,7 @@
               }
             },
             React.createElement(RN.Text, { style: styles.filename }, item.filename),
-            React.createElement(RN.Text, { style: styles.state }, blocked.has(item.key) ? "Hidden. Tap to unhide" : "Visible. Tap to hide")
+            React.createElement(RN.Text, { style: styles.state }, blocked.has(globalAttachmentKey(item.filename)) ? "Hidden. Tap to unhide" : "Visible. Tap to hide")
           )),
       React.createElement(
         RN.Pressable,
@@ -504,29 +383,22 @@
         RN.Pressable,
         {
           style: [styles.button, styles.secondaryButton],
-          onPress: () => RN.Clipboard.setString([
-            `HideMediaEverywhere 0.8.0`,
-            `Row calls: ${storage.rowCallCount || 0}`,
-            `Media rows: ${storage.mediaRowCount || 0}`,
-            `Replaced attachments: ${storage.replacementCount || 0}`,
-            `Hide-all test: ${storage.hideAllAttachments ? "ON" : "OFF"}`,
-            storage.refreshStatus || "No refresh requested yet.",
-            storage.latestMatchReport || "No media match report yet.",
-            "",
-            "Action-sheet probe:",
-            storage.actionSheetProbeStatus || "Probe not installed.",
-            `Captures: ${storage.actionSheetCaptureCount || 0}`,
-            storage.actionSheetProbeError || "No action-sheet probe errors.",
-            ...(readActionSheetReports().length
-              ? readActionSheetReports().flatMap((report, index) => ["", `Capture ${index + 1}:`, report])
-              : ["No action sheet captured yet."]),
-            "",
-            "Message sheet renderer:",
-            storage.messageSheetRenderStatus || "Renderer probe not installed yet.",
-            `Render captures: ${storage.messageSheetRenderCount || 0}`,
-            storage.messageSheetModuleReport || "No message-sheet module resolved yet.",
-            storage.messageSheetRenderReport || "No message-sheet render captured yet."
-          ].join("\n"))
+          onPress: () => {
+            const menuReport = scanMenuModules();
+            RN.Clipboard.setString([
+              `HideMediaEverywhere 0.9.0`,
+              `Known-good renderer baseline: 487003a`,
+              `Row calls: ${storage.rowCallCount || 0}`,
+              `Media rows: ${storage.mediaRowCount || 0}`,
+              `Replaced attachments: ${storage.replacementCount || 0}`,
+              `Hide-all test: ${storage.hideAllAttachments ? "ON" : "OFF"}`,
+              storage.refreshStatus || "No refresh requested yet.",
+              storage.latestMatchReport || "No media match report yet.",
+              "",
+              "Native menu discovery:",
+              menuReport
+            ].join("\n"));
+          }
         },
         React.createElement(RN.Text, { style: styles.buttonText }, "Copy complete report")
       ),
@@ -549,26 +421,13 @@
     onLoad() {
       storage.hideAllAttachments = false;
       storage.replacementCount = 0;
-      storage.actionSheetCaptureCount = 0;
-      storage.actionSheetReports = "[]";
-      storage.actionSheetProbeError = "";
-      storage.messageSheetRenderCount = 0;
-      storage.messageSheetModuleReport = "";
-      storage.messageSheetRenderReport = "";
-      storage.messageSheetRenderStatus = "";
       installPatch();
-      installActionSheetProbe();
     },
     onUnload() {
       try {
         unpatchRowData?.();
-        for (const unpatch of unpatchActionSheets) unpatch?.();
-        for (const unpatch of unpatchSheetRenderers) unpatch?.();
       } finally {
         unpatchRowData = null;
-        unpatchActionSheets = [];
-        unpatchSheetRenderers = [];
-        patchedSheetModules = new WeakSet();
       }
     },
     settings: Settings
