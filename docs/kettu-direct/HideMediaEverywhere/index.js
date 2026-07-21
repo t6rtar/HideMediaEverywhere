@@ -461,7 +461,7 @@
           onPress: () => {
             const menuReport = scanMenuModules();
             RN.Clipboard.setString([
-              `HideMediaEverywhere 1.1.0`,
+              `HideMediaEverywhere 1.1.1`,
               `Known-good renderer baseline: 487003a`,
               `Row calls: ${storage.rowCallCount || 0}`,
               `Media rows: ${storage.mediaRowCount || 0}`,
@@ -503,8 +503,6 @@
       refreshTargets.clear();
       storage.hideAllAttachments = false;
       storage.replacementCount = 0;
-      storage.lastMediaRowRevision = undefined;
-      storage.refreshDispatchFailures = "";
       installPatch();
     },
     onUnload() {
