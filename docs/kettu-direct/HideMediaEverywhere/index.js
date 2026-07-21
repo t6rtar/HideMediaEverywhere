@@ -279,6 +279,11 @@
     return typeof row?.changeType === "number" ? row.changeType : null;
   }
 
+  function nativeRowIndex(row) {
+    const index = row?.index;
+    return typeof index === "number" && index >= 0 && Math.floor(index) === index ? index : null;
+  }
+
   function uniqueStrings(values) {
     return [...new Set(values.filter(Boolean))];
   }
@@ -339,6 +344,7 @@
         messageId,
         channelId: nativeRowChannelId(row),
         changeType: nativeRowChangeType(row),
+        index: nativeRowIndex(row),
         filenames: uniqueStrings(rowFilenames),
         rowJson: JSON.stringify(row)
       });
@@ -372,6 +378,7 @@
       `channelIds=${capture.channelIds.join(",") || "<not exposed>"}`,
       `filenames=${capture.filenames.join(",") || "<none>"}`,
       `changeTypes=${capture.entries.map((entry) => entry.changeType ?? "<missing>").join(",") || "<none>"}`,
+      `indices=${capture.entries.map((entry) => entry.index ?? "<missing>").join(",") || "<none>"}`,
       `argTypes=${capture.argumentTypes.join(",")}`,
       `replaySafe=${capture.replaySafeArguments}`
     ].join(" ");
@@ -386,7 +393,8 @@
     const channelId = stringId(target?.channelId);
     return capture.entries.find((entry) =>
       entry.messageId === messageId &&
-      entry.changeType === 2 &&
+      (entry.changeType === 0 || entry.changeType === 2) &&
+      entry.index !== null &&
       entry.filenames.includes(filename) &&
       (!channelId || !entry.channelId || entry.channelId === channelId)
     ) || null;
@@ -433,13 +441,29 @@
       return false;
     }
     const replayArgs = latest.args.slice();
-    replayArgs[1] = `[${capturedRow.rowJson}]`;
+    let replayRow;
+    try {
+      replayRow = JSON.parse(capturedRow.rowJson);
+    } catch (error) {
+      lastNativeReplay = `Skipped: captured native row could not be decoded: ${String(error)}`;
+      return false;
+    }
+    if (
+      nativeRowMessageId(replayRow) !== capturedRow.messageId ||
+      nativeRowIndex(replayRow) !== capturedRow.index ||
+      nativeRowChangeType(replayRow) !== capturedRow.changeType
+    ) {
+      lastNativeReplay = "Skipped: captured native row identity changed before replay.";
+      return false;
+    }
+    replayRow.changeType = 2;
+    replayArgs[1] = JSON.stringify([replayRow]);
     replayArgs[3] = null;
     replayingNativeRows = true;
     try {
       manager.updateRows.apply(manager, replayArgs);
       nativeReplaySubmissions++;
-      lastNativeReplay = `Submitted one matching changeType=2 native media row without stale scroll data. ageMs=${ageMs} messageId=${target.messageId} filename=${attachmentFilename(target)}`;
+      lastNativeReplay = `Submitted one matching native media row as changeType=2 without stale scroll data. capturedChangeType=${capturedRow.changeType} index=${capturedRow.index} ageMs=${ageMs} messageId=${target.messageId} filename=${attachmentFilename(target)}`;
       return true;
     } catch (error) {
       lastNativeReplay = `Native replay failed: ${String(error)}`;
@@ -808,7 +832,7 @@
           onPress: () => {
             const menuReport = "Skipped in the focused row-refresh build.";
             RN.Clipboard.setString([
-              `HideMediaEverywhere 1.4.0`,
+              `HideMediaEverywhere 1.5.0`,
               `Known-good renderer baseline: 487003a`,
               `Row calls: ${storage.rowCallCount || 0}`,
               `Media rows: ${storage.mediaRowCount || 0}`,
