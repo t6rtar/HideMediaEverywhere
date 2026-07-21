@@ -188,6 +188,8 @@
   function rememberAttachments(message, attachments) {
     if (!Array.isArray(attachments) || attachments.length === 0) return;
     const authorId = authorIdFrom(message);
+    const messageId = String(message?.id ?? message?.messageId ?? message?.message_id ?? "");
+    const channelId = String(message?.channel_id ?? message?.channelId ?? message?.messageChannelId ?? "");
     const recent = readRecent();
     for (const attachment of attachments) {
       const filename = attachmentFilename(attachment);
@@ -195,7 +197,7 @@
       const key = attachmentKey(authorId, filename);
       const oldIndex = recent.findIndex((item) => item.key === key);
       if (oldIndex !== -1) recent.splice(oldIndex, 1);
-      recent.unshift({ key, filename, authorId });
+      recent.unshift({ key, filename, authorId, channelId, messageId });
     }
     storage.recentAttachments = JSON.stringify(recent.slice(0, 30));
   }
@@ -300,20 +302,64 @@
   }
 
   function requestMessageRefresh() {
+    storage.refreshCount = (storage.refreshCount || 0) + 1;
+    storage.refreshTarget = "<none>";
+    storage.refreshMessageFound = false;
+    storage.refreshDispatchError = "";
+
     try {
-      const messageStore = findByProps(["getMessage", "getMessages"]);
-      if (typeof messageStore?.doEmitChanges === "function") {
-        messageStore.doEmitChanges();
-        storage.refreshStatus = "Requested a message-store refresh with doEmitChanges.";
-      } else if (typeof messageStore?.emitChange === "function") {
-        messageStore.emitChange();
-        storage.refreshStatus = "Requested a message-store refresh with emitChange.";
-      } else {
-        storage.refreshStatus = "Message-store refresh method was unavailable.";
+      const target = readRecent().find((item) =>
+        typeof item?.channelId === "string" && item.channelId &&
+        typeof item?.messageId === "string" && item.messageId
+      );
+      if (!target) {
+        storage.refreshStatus = "No captured media message is available for refresh.";
+        return;
       }
-      storage.refreshCount = (storage.refreshCount || 0) + 1;
+
+      storage.refreshTarget = `${target.channelId}:${target.messageId}`;
+      storage.latestMatchReport = [
+        `refresh pending ${new Date().toISOString()}`,
+        `refreshTarget=${storage.refreshTarget}`,
+        `hideAllAttachments=${!!storage.hideAllAttachments}`,
+        `blockedKeys=${[...readBlocked()].join(", ") || "<none>"}`,
+        "Waiting for generateMessageRowData to rebuild this media row."
+      ].join("\n");
+
+      const messageStore = metro.findByStoreName?.("MessageStore") ?? findByProps(["getMessage", "getMessages"]);
+      const freshMessage = messageStore?.getMessage?.(target.channelId, target.messageId);
+      storage.refreshMessageFound = !!freshMessage;
+      if (!freshMessage || !Array.isArray(freshMessage.attachments)) {
+        storage.refreshStatus = "Newest captured media message is not present in MessageStore.";
+        return;
+      }
+
+      const dispatcher = metro.common?.FluxDispatcher ?? findByProps(["dispatch", "subscribe", "unsubscribe"]);
+      if (typeof dispatcher?.dispatch !== "function") {
+        storage.refreshStatus = "FluxDispatcher.dispatch is unavailable.";
+        return;
+      }
+
+      const updateMessage = cloneWithOverrides(freshMessage, {
+        id: target.messageId,
+        channel_id: target.channelId,
+        attachments: freshMessage.attachments.slice()
+      });
+      storage.refreshStatus = "Queued one local MESSAGE_UPDATE for the newest captured media message.";
+      Promise.resolve()
+        .then(() => dispatcher.dispatch({ type: "MESSAGE_UPDATE", message: updateMessage }))
+        .then(
+          () => {
+            storage.refreshStatus = "Dispatched one local MESSAGE_UPDATE for the newest captured media message.";
+          },
+          (error) => {
+            storage.refreshDispatchError = String(error);
+            storage.refreshStatus = `Local MESSAGE_UPDATE failed: ${String(error)}`;
+          }
+        );
     } catch (error) {
-      storage.refreshStatus = `Message-store refresh failed: ${String(error)}`;
+      storage.refreshDispatchError = String(error);
+      storage.refreshStatus = `Local MESSAGE_UPDATE failed: ${String(error)}`;
     }
   }
 
@@ -384,15 +430,18 @@
         {
           style: [styles.button, styles.secondaryButton],
           onPress: () => {
-            const menuReport = scanMenuModules();
+            const menuReport = "Skipped in the focused row-refresh build.";
             RN.Clipboard.setString([
-              `HideMediaEverywhere 1.0.2`,
+              `HideMediaEverywhere 1.2.0`,
               `Known-good renderer baseline: 487003a`,
               `Row calls: ${storage.rowCallCount || 0}`,
               `Media rows: ${storage.mediaRowCount || 0}`,
               `Replaced attachments: ${storage.replacementCount || 0}`,
               `Hide-all test: ${storage.hideAllAttachments ? "ON" : "OFF"}`,
+              `Refresh target: ${storage.refreshTarget || "<none>"}`,
+              `Fresh message found: ${storage.refreshMessageFound ? "yes" : "no"}`,
               storage.refreshStatus || "No refresh requested yet.",
+              `Refresh dispatch error: ${storage.refreshDispatchError || "<none>"}`,
               storage.latestMatchReport || "No media match report yet.",
               "",
               "Native menu discovery:",
