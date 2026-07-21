@@ -6,6 +6,8 @@
   const logger = vendetta.logger;
   let unpatchRowData = null;
   let unpatchActionSheets = [];
+  let unpatchSheetRenderers = [];
+  let patchedSheetModules = new WeakSet();
 
   function keysOf(value) {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return [];
@@ -22,6 +24,17 @@
       return metro.find(metro.filters.byProps(...props));
     }
     return undefined;
+  }
+
+  function findAllByProps(props) {
+    if (typeof metro.findByPropsAll === "function") {
+      try {
+        const matches = metro.findByPropsAll(...props);
+        if (Array.isArray(matches)) return matches.filter(Boolean);
+      } catch { }
+    }
+    const match = findByProps(props);
+    return match ? [match] : [];
   }
 
   function filenameFromUrl(url) {
@@ -192,6 +205,88 @@
     }
   }
 
+  function elementTypeName(type) {
+    if (typeof type === "string") return type;
+    if (typeof type === "function") return type.displayName || type.name || "anonymous function";
+    if (typeof type === "symbol") return String(type);
+    if (type && typeof type === "object") {
+      return type.displayName || type.name || type.render?.displayName || type.render?.name || `object(${keysOf(type).join(",")})`;
+    }
+    return String(type);
+  }
+
+  function describeElementTree(root) {
+    const lines = [];
+    const seen = new Set();
+    function walk(node, path, depth) {
+      if (lines.length >= 180 || depth > 9 || node === null || node === undefined || typeof node === "boolean") return;
+      if (Array.isArray(node)) {
+        lines.push(`${path}: array(${node.length})`);
+        for (let index = 0; index < Math.min(node.length, 40); index++) walk(node[index], `${path}[${index}]`, depth + 1);
+        return;
+      }
+      if (typeof node !== "object") {
+        lines.push(`${path}: ${typeof node}=${String(node).slice(0, 100)}`);
+        return;
+      }
+      if (seen.has(node)) {
+        lines.push(`${path}: <seen>`);
+        return;
+      }
+      seen.add(node);
+      const props = node.props;
+      const summaries = ["label", "title", "text", "name"].flatMap((key) => {
+        const value = props?.[key];
+        return typeof value === "string" ? [`${key}=${JSON.stringify(value.slice(0, 100))}`] : [];
+      });
+      lines.push(`${path}: type=${elementTypeName(node.type)} keys=${keysOf(node).join(",") || "<none>"} props=${keysOf(props).slice(0, 80).join(",") || "<none>"}${summaries.length ? ` ${summaries.join(" ")}` : ""}`);
+      if (props && Object.prototype.hasOwnProperty.call(props, "children")) walk(props.children, `${path}.children`, depth + 1);
+    }
+    walk(root, "result", 0);
+    return lines.join("\n") || "<empty render result>";
+  }
+
+  function patchMessageSheetImporter(args) {
+    if (args?.[1] !== "MessageLongPressActionSheet") return;
+    const importer = args[0];
+    args[0] = Promise.resolve(importer).then((module) => {
+      try {
+        storage.messageSheetModuleReport = [
+          `resolved ${new Date().toISOString()}`,
+          `moduleType=${typeof module}`,
+          `moduleKeys=${keysOf(module).join(",") || "<none>"}`,
+          `defaultType=${typeof module?.default}`,
+          `defaultKeys=${keysOf(module?.default).join(",") || "<none>"}`,
+          `defaultName=${elementTypeName(module?.default)}`
+        ].join("\n");
+        if (!module || (typeof module !== "object" && typeof module !== "function") || patchedSheetModules.has(module)) return module;
+        patchedSheetModules.add(module);
+        let target = module;
+        let method = "default";
+        if (typeof module.default !== "function" && typeof module.default?.render === "function") {
+          target = module.default;
+          method = "render";
+        }
+        if (typeof target?.[method] !== "function") {
+          storage.messageSheetRenderStatus = `No patchable renderer. ${method} is ${typeof target?.[method]}.`;
+          return module;
+        }
+        unpatchSheetRenderers.push(vendetta.patcher.after(method, target, (_renderArgs, result) => {
+          try {
+            storage.messageSheetRenderCount = (storage.messageSheetRenderCount || 0) + 1;
+            storage.messageSheetRenderReport = describeElementTree(result);
+          } catch (error) {
+            storage.messageSheetRenderStatus = `Render capture error: ${String(error)}`;
+          }
+        }));
+        storage.messageSheetRenderStatus = `Observing resolved ${method} renderer without changing it.`;
+      } catch (error) {
+        storage.messageSheetRenderStatus = `Renderer patch error: ${String(error)}`;
+      }
+      return module;
+    });
+  }
+
   function cloneWithOverrides(value, overrides) {
     const descriptors = Object.getOwnPropertyDescriptors(value);
     for (const [key, nextValue] of Object.entries(overrides)) {
@@ -279,10 +374,21 @@
       return;
     }
 
-    const targets = [
-      [findByProps(["showSimpleActionSheet"]), "showSimpleActionSheet"],
-      [findByProps(["openLazy", "hideActionSheet"]), "openLazy"]
+    const targetGroups = [
+      [findAllByProps(["showSimpleActionSheet"]), "showSimpleActionSheet"],
+      [findAllByProps(["openLazy", "hideActionSheet"]), "openLazy"]
     ];
+    const targets = [];
+    const seenTargets = new Set();
+    for (const [modules, method] of targetGroups) {
+      for (const module of modules) {
+        if (!module || typeof module[method] !== "function") continue;
+        const identity = module[method];
+        if (seenTargets.has(identity)) continue;
+        seenTargets.add(identity);
+        targets.push([module, method]);
+      }
+    }
     const installed = [];
     for (const [module, method] of targets) {
       if (!module || typeof module[method] !== "function") continue;
@@ -290,17 +396,18 @@
         unpatchActionSheets.push(vendetta.patcher.before(method, module, (args) => {
           try {
             saveActionSheetCapture(method, args);
+            if (method === "openLazy") patchMessageSheetImporter(args);
           } catch (error) {
             storage.actionSheetProbeError = `${method} capture error: ${String(error)}`;
           }
         }));
-        installed.push(method);
+        installed.push(`${method}#${installed.filter((name) => name.startsWith(method)).length + 1}`);
       } catch (error) {
         storage.actionSheetProbeError = `${method} patch error: ${String(error)}`;
       }
     }
     storage.actionSheetProbeStatus = installed.length
-      ? `Observing ${installed.join(" + ")} without changing them.`
+      ? `Observing ${installed.join(" + ")} without changing them. Candidates: simple=${targetGroups[0][0].length}, lazy=${targetGroups[1][0].length}.`
       : "No compatible action-sheet entry point was found.";
   }
 
@@ -398,7 +505,7 @@
         {
           style: [styles.button, styles.secondaryButton],
           onPress: () => RN.Clipboard.setString([
-            `HideMediaEverywhere 0.7.0`,
+            `HideMediaEverywhere 0.8.0`,
             `Row calls: ${storage.rowCallCount || 0}`,
             `Media rows: ${storage.mediaRowCount || 0}`,
             `Replaced attachments: ${storage.replacementCount || 0}`,
@@ -412,7 +519,13 @@
             storage.actionSheetProbeError || "No action-sheet probe errors.",
             ...(readActionSheetReports().length
               ? readActionSheetReports().flatMap((report, index) => ["", `Capture ${index + 1}:`, report])
-              : ["No action sheet captured yet."])
+              : ["No action sheet captured yet."]),
+            "",
+            "Message sheet renderer:",
+            storage.messageSheetRenderStatus || "Renderer probe not installed yet.",
+            `Render captures: ${storage.messageSheetRenderCount || 0}`,
+            storage.messageSheetModuleReport || "No message-sheet module resolved yet.",
+            storage.messageSheetRenderReport || "No message-sheet render captured yet."
           ].join("\n"))
         },
         React.createElement(RN.Text, { style: styles.buttonText }, "Copy complete report")
@@ -439,6 +552,10 @@
       storage.actionSheetCaptureCount = 0;
       storage.actionSheetReports = "[]";
       storage.actionSheetProbeError = "";
+      storage.messageSheetRenderCount = 0;
+      storage.messageSheetModuleReport = "";
+      storage.messageSheetRenderReport = "";
+      storage.messageSheetRenderStatus = "";
       installPatch();
       installActionSheetProbe();
     },
@@ -446,9 +563,12 @@
       try {
         unpatchRowData?.();
         for (const unpatch of unpatchActionSheets) unpatch?.();
+        for (const unpatch of unpatchSheetRenderers) unpatch?.();
       } finally {
         unpatchRowData = null;
         unpatchActionSheets = [];
+        unpatchSheetRenderers = [];
+        patchedSheetModules = new WeakSet();
       }
     },
     settings: Settings
