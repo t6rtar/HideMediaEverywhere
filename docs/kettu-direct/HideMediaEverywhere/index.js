@@ -5,6 +5,9 @@
   const storage = vendetta.plugin.storage;
   const logger = vendetta.logger;
   let unpatchRowData = null;
+  let activeChannelId = null;
+  let settingsRevision = 0;
+  const refreshTargets = new Map();
 
   function keysOf(value) {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return [];
@@ -156,6 +159,29 @@
     return attachmentKey("*", filename);
   }
 
+  function messageIdFrom(message) {
+    const value = message?.id ?? message?.messageId ?? message?.message_id;
+    return value == null ? "" : String(value);
+  }
+
+  function channelIdFrom(message) {
+    const value = message?.channel_id ?? message?.channelId ?? message?.messageChannelId;
+    return value == null ? "" : String(value);
+  }
+
+  function rememberRefreshTarget(message) {
+    if (!message || !Array.isArray(message.attachments) || message.attachments.length === 0) return;
+    const messageId = messageIdFrom(message);
+    const channelId = channelIdFrom(message);
+    if (!messageId || !channelId) return;
+    if (activeChannelId && channelId !== activeChannelId) refreshTargets.clear();
+    activeChannelId = channelId;
+    const key = `${channelId}:${messageId}`;
+    refreshTargets.delete(key);
+    refreshTargets.set(key, { channelId, messageId });
+    while (refreshTargets.size > 30) refreshTargets.delete(refreshTargets.keys().next().value);
+  }
+
   function normalizeBlockedKey(key) {
     const colon = key.indexOf(":");
     return colon === -1 ? globalAttachmentKey(key) : globalAttachmentKey(key.slice(colon + 1));
@@ -247,6 +273,7 @@
       try {
         const sourceMessage = args?.[0]?.message;
         const blocked = readBlocked();
+        rememberRefreshTarget(sourceMessage);
         rememberAttachments(sourceMessage, sourceMessage?.attachments);
         const sourceAttachments = sourceMessage?.attachments;
         if (Array.isArray(sourceAttachments) && sourceAttachments.length > 0) {
@@ -254,6 +281,7 @@
           storage.latestMatchReport = [
             `match ${new Date().toISOString()}`,
             "postGenerationReplacement=true",
+            `settingsRevision=${settingsRevision}`,
             `blockedKeys=${[...blocked].join(", ") || "<none>"}`,
             ...attachmentMatchLines("source", sourceAttachments, blocked)
           ].join("\n");
@@ -261,6 +289,7 @@
         const rowAttachments = result?.message?.attachments;
         rememberAttachments(sourceMessage, rowAttachments);
         if (Array.isArray(rowAttachments) && rowAttachments.length > 0) {
+          storage.lastMediaRowRevision = settingsRevision;
           const visible = rowAttachments.filter((attachment) => !shouldHideAttachment(attachment, blocked));
           const removed = rowAttachments.length - visible.length;
           storage.latestMatchReport = [
@@ -300,8 +329,54 @@
   }
 
   function requestMessageRefresh() {
+    settingsRevision++;
+    storage.settingsRevision = settingsRevision;
+    storage.latestMatchReport = [
+      `refresh pending ${new Date().toISOString()}`,
+      `settingsRevision=${settingsRevision}`,
+      `hideAllAttachments=${!!storage.hideAllAttachments}`,
+      `blockedKeys=${[...readBlocked()].join(", ") || "<none>"}`,
+      "No media row has regenerated since this setting change."
+    ].join("\n");
+
     try {
-      const messageStore = findByProps(["getMessage", "getMessages"]);
+      const dispatcher = metro.common?.FluxDispatcher ?? findByProps(["dispatch", "subscribe", "unsubscribe"]);
+      const messageStore = metro.findByStoreName?.("MessageStore") ?? findByProps(["getMessage", "getMessages"]);
+      const messages = [...refreshTargets.values()]
+        .map((target) => ({ target, message: messageStore?.getMessage?.(target.channelId, target.messageId) }))
+        .filter((entry) => entry.message && Array.isArray(entry.message.attachments));
+      if (typeof dispatcher?.dispatch === "function" && messages.length > 0) {
+        storage.refreshStatus = `Queued ${messages.length} local MESSAGE_UPDATE refresh${messages.length === 1 ? "" : "es"} for captured media rows.`;
+        storage.refreshCount = (storage.refreshCount || 0) + 1;
+        Promise.resolve().then(async () => {
+          let dispatched = 0;
+          const failures = [];
+          for (const { target, message } of messages) {
+            try {
+              if (typeof dispatcher.isDispatching === "function" && dispatcher.isDispatching() && typeof dispatcher.wait === "function") {
+                await new Promise((resolve) => dispatcher.wait(resolve));
+              }
+              const freshMessage = {
+                ...message,
+                id: target.messageId,
+                channel_id: target.channelId,
+                attachments: message.attachments
+              };
+              await dispatcher.dispatch({ type: "MESSAGE_UPDATE", message: freshMessage });
+              dispatched++;
+            } catch (error) {
+              failures.push(String(error));
+            }
+          }
+          storage.refreshDispatchFailures = failures.join(" | ");
+          storage.refreshStatus = `Dispatched ${dispatched}/${messages.length} local MESSAGE_UPDATE refreshes for captured media rows.`;
+        }).catch((error) => {
+          storage.refreshDispatchFailures = String(error);
+          storage.refreshStatus = `Local MESSAGE_UPDATE refresh failed: ${String(error)}`;
+        });
+        return;
+      }
+
       if (typeof messageStore?.doEmitChanges === "function") {
         messageStore.doEmitChanges();
         storage.refreshStatus = "Requested a message-store refresh with doEmitChanges.";
@@ -386,13 +461,17 @@
           onPress: () => {
             const menuReport = scanMenuModules();
             RN.Clipboard.setString([
-              `HideMediaEverywhere 1.0.2`,
+              `HideMediaEverywhere 1.1.0`,
               `Known-good renderer baseline: 487003a`,
               `Row calls: ${storage.rowCallCount || 0}`,
               `Media rows: ${storage.mediaRowCount || 0}`,
               `Replaced attachments: ${storage.replacementCount || 0}`,
               `Hide-all test: ${storage.hideAllAttachments ? "ON" : "OFF"}`,
+              `Settings revision: ${settingsRevision}`,
+              `Last regenerated media-row revision: ${storage.lastMediaRowRevision ?? "<none>"}`,
+              `Captured media refresh targets: ${refreshTargets.size}`,
               storage.refreshStatus || "No refresh requested yet.",
+              storage.refreshDispatchFailures ? `Refresh dispatch failures: ${storage.refreshDispatchFailures}` : "No refresh dispatch failures recorded.",
               storage.latestMatchReport || "No media match report yet.",
               "",
               "Native menu discovery:",
@@ -419,8 +498,13 @@
 
   return {
     onLoad() {
+      activeChannelId = null;
+      settingsRevision = 0;
+      refreshTargets.clear();
       storage.hideAllAttachments = false;
       storage.replacementCount = 0;
+      storage.lastMediaRowRevision = undefined;
+      storage.refreshDispatchFailures = "";
       installPatch();
     },
     onUnload() {
@@ -428,6 +512,7 @@
         unpatchRowData?.();
       } finally {
         unpatchRowData = null;
+        refreshTargets.clear();
       }
     },
     settings: Settings
