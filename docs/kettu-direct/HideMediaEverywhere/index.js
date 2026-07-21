@@ -5,7 +5,7 @@
   const storage = vendetta.plugin.storage;
   const logger = vendetta.logger;
   let unpatchRowData = null;
-  let unpatchActionSheet = null;
+  let unpatchActionSheets = [];
 
   function keysOf(value) {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return [];
@@ -147,14 +147,18 @@
     }
   }
 
-  function describeActionSheet(args) {
+  function describeActionSheet(method, args) {
     const config = args?.[0];
     const options = Array.isArray(config?.options) ? config.options : [];
     const messagePaths = [];
     findMessagePaths(args, "args", 0, new Set(), messagePaths);
     return [
       `action sheet ${new Date().toISOString()}`,
+      `method=${method}`,
       `argCount=${Array.isArray(args) ? args.length : "n/a"}`,
+      ...Array.from({ length: Math.min(args?.length || 0, 5) }, (_, index) =>
+        `arg[${index}]: type=${Array.isArray(args[index]) ? "array" : typeof args[index]} value=${typeof args[index] === "string" ? args[index] : "<non-string>"} keys=${keysOf(args[index]).slice(0, 60).join(",") || "<none>"}`
+      ),
       `key=${typeof config?.key === "string" ? config.key : "<none>"}`,
       `configKeys=${keysOf(config).join(", ") || "<none>"}`,
       `headerKeys=${keysOf(config?.header).join(", ") || "<none>"}`,
@@ -163,6 +167,29 @@
       "message-like paths:",
       ...(messagePaths.length ? messagePaths : ["<none>"])
     ].join("\n");
+  }
+
+  function saveActionSheetCapture(method, args) {
+    const captures = (() => {
+      try {
+        const parsed = JSON.parse(storage.actionSheetReports || "[]");
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    })();
+    captures.unshift(describeActionSheet(method, args));
+    storage.actionSheetReports = JSON.stringify(captures.slice(0, 8));
+    storage.actionSheetCaptureCount = (storage.actionSheetCaptureCount || 0) + 1;
+  }
+
+  function readActionSheetReports() {
+    try {
+      const parsed = JSON.parse(storage.actionSheetReports || "[]");
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
   }
 
   function cloneWithOverrides(value, overrides) {
@@ -247,25 +274,34 @@
   }
 
   function installActionSheetProbe() {
-    const sheetModule = findByProps(["showSimpleActionSheet"]);
-    if (!sheetModule || typeof sheetModule.showSimpleActionSheet !== "function") {
-      storage.actionSheetProbeStatus = "showSimpleActionSheet was not found.";
-      return;
-    }
     if (typeof vendetta.patcher?.before !== "function") {
       storage.actionSheetProbeStatus = `patcher.before unavailable. Keys: ${keysOf(vendetta.patcher).join(", ") || "<none>"}`;
       return;
     }
 
-    unpatchActionSheet = vendetta.patcher.before("showSimpleActionSheet", sheetModule, (args) => {
+    const targets = [
+      [findByProps(["showSimpleActionSheet"]), "showSimpleActionSheet"],
+      [findByProps(["openLazy", "hideActionSheet"]), "openLazy"]
+    ];
+    const installed = [];
+    for (const [module, method] of targets) {
+      if (!module || typeof module[method] !== "function") continue;
       try {
-        storage.actionSheetReport = describeActionSheet(args);
-        storage.actionSheetCaptureCount = (storage.actionSheetCaptureCount || 0) + 1;
+        unpatchActionSheets.push(vendetta.patcher.before(method, module, (args) => {
+          try {
+            saveActionSheetCapture(method, args);
+          } catch (error) {
+            storage.actionSheetProbeError = `${method} capture error: ${String(error)}`;
+          }
+        }));
+        installed.push(method);
       } catch (error) {
-        storage.actionSheetReport = `Action-sheet capture error: ${String(error)}`;
+        storage.actionSheetProbeError = `${method} patch error: ${String(error)}`;
       }
-    });
-    storage.actionSheetProbeStatus = "Observing action sheets without changing them.";
+    }
+    storage.actionSheetProbeStatus = installed.length
+      ? `Observing ${installed.join(" + ")} without changing them.`
+      : "No compatible action-sheet entry point was found.";
   }
 
   function toggleRecent(item) {
@@ -362,7 +398,7 @@
         {
           style: [styles.button, styles.secondaryButton],
           onPress: () => RN.Clipboard.setString([
-            `HideMediaEverywhere 0.6.0`,
+            `HideMediaEverywhere 0.7.0`,
             `Row calls: ${storage.rowCallCount || 0}`,
             `Media rows: ${storage.mediaRowCount || 0}`,
             `Replaced attachments: ${storage.replacementCount || 0}`,
@@ -373,7 +409,10 @@
             "Action-sheet probe:",
             storage.actionSheetProbeStatus || "Probe not installed.",
             `Captures: ${storage.actionSheetCaptureCount || 0}`,
-            storage.actionSheetReport || "No action sheet captured yet."
+            storage.actionSheetProbeError || "No action-sheet probe errors.",
+            ...(readActionSheetReports().length
+              ? readActionSheetReports().flatMap((report, index) => ["", `Capture ${index + 1}:`, report])
+              : ["No action sheet captured yet."])
           ].join("\n"))
         },
         React.createElement(RN.Text, { style: styles.buttonText }, "Copy complete report")
@@ -397,16 +436,19 @@
     onLoad() {
       storage.hideAllAttachments = false;
       storage.replacementCount = 0;
+      storage.actionSheetCaptureCount = 0;
+      storage.actionSheetReports = "[]";
+      storage.actionSheetProbeError = "";
       installPatch();
       installActionSheetProbe();
     },
     onUnload() {
       try {
         unpatchRowData?.();
-        unpatchActionSheet?.();
+        for (const unpatch of unpatchActionSheets) unpatch?.();
       } finally {
         unpatchRowData = null;
-        unpatchActionSheet = null;
+        unpatchActionSheets = [];
       }
     },
     settings: Settings
