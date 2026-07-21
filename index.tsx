@@ -562,7 +562,7 @@ function addCurtain(cover: HTMLElement, reveal: RevealSource, dims?: Placeholder
     const HANDLE_H = 18;
     let atBottomState: boolean | null = null;
     const apply = () => {
-        cover.style.clipPath = `inset(${revealPx}px 0 0 0)`;
+        cover.style.transform = `translateY(${revealPx}px)`;
         const maxTop = (height || wrapper.clientHeight) - HANDLE_H;
         const top    = Math.max(0, Math.min(revealPx, maxTop));
         handle.style.top = `${top}px`;
