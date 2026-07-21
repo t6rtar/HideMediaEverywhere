@@ -6,8 +6,22 @@
   const logger = vendetta.logger;
   let unpatchRowData = null;
   let unpatchNativeRows = null;
+  let unpatchNativeClearRows = null;
   let nativeUpdateRowsCalls = 0;
+  let nativeClearRowsCalls = 0;
   let lastNativeInvocation = "No DCDChatManager.updateRows call captured yet.";
+  let nativeMediaCaptures = [];
+  let latestNativeArgsByTag = new Map();
+  let replayingNativeRows = false;
+  let nativeReplayAttempts = 0;
+  let nativeReplaySubmissions = 0;
+  let nativeCaptureInvalidations = 0;
+  let nativeClearRowsGuardActive = false;
+  let lastNativeCapture = "No native media batch captured yet.";
+  let lastNativeReplay = "No native media replay attempted yet.";
+  let lastNativeInvalidation = "No native media capture invalidated yet.";
+  const MAX_NATIVE_MEDIA_CAPTURES = 8;
+  const MAX_NATIVE_CAPTURE_AGE_MS = 60 * 1000;
 
   function keysOf(value) {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return [];
@@ -236,6 +250,205 @@
     return !!filename && blocked.has(globalAttachmentKey(filename));
   }
 
+  function stringId(value) {
+    return typeof value === "string" || typeof value === "number" ? String(value) : "";
+  }
+
+  function nativeRowMessageId(row) {
+    return stringId(
+      row?.message?.id ??
+      row?.message?.messageId ??
+      row?.message?.message_id ??
+      row?.messageId ??
+      row?.message_id ??
+      row?.id
+    );
+  }
+
+  function nativeRowChannelId(row) {
+    return stringId(
+      row?.message?.channel_id ??
+      row?.message?.channelId ??
+      row?.message?.messageChannelId ??
+      row?.channelId ??
+      row?.channel_id
+    );
+  }
+
+  function nativeRowChangeType(row) {
+    return typeof row?.changeType === "number" ? row.changeType : null;
+  }
+
+  function uniqueStrings(values) {
+    return [...new Set(values.filter(Boolean))];
+  }
+
+  function nativeArgumentType(value) {
+    return value === null ? "null" : typeof value;
+  }
+
+  function nativeArgumentsAreReplaySafe(args) {
+    if (!Array.isArray(args) || args.length !== 7 || args[6] !== false) return false;
+    return args.every((value, index) => {
+      if (index === 1 || value === null) return true;
+      return ["string", "number", "boolean", "undefined"].includes(typeof value);
+    });
+  }
+
+  function nativeTagKey(value) {
+    if (typeof value !== "string" && typeof value !== "number") return "";
+    return `${typeof value}:${String(value)}`;
+  }
+
+  function invalidateNativeCapturesForTag(tagKey, reason, messageIds) {
+    if (!tagKey) return;
+    const ids = new Set(messageIds || []);
+    const before = nativeMediaCaptures.length;
+    nativeMediaCaptures = nativeMediaCaptures.filter((capture) => {
+      if (capture.tagKey !== tagKey) return true;
+      if (ids.size === 0) return false;
+      return !capture.entries.some((entry) => ids.has(entry.messageId));
+    });
+    const removed = before - nativeMediaCaptures.length;
+    if (removed > 0) {
+      nativeCaptureInvalidations += removed;
+      lastNativeInvalidation = `${reason}. tag=${tagKey} removed=${removed}`;
+    }
+  }
+
+  function captureNativeMediaBatch(args, rows, mediaRows) {
+    if (replayingNativeRows || typeof args?.[1] !== "string") return;
+
+    const tagKey = nativeTagKey(args[0]);
+    if (!tagKey) return;
+
+    const entries = [];
+    const filenames = [];
+    for (const row of mediaRows) {
+      const rowFilenames = [];
+      for (const attachment of row.message.attachments) {
+        const filename = attachmentFilename(attachment);
+        if (filename) {
+          rowFilenames.push(filename);
+          filenames.push(filename);
+        }
+      }
+      const messageId = nativeRowMessageId(row);
+      if (!messageId || rowFilenames.length === 0) continue;
+      entries.push({
+        messageId,
+        channelId: nativeRowChannelId(row),
+        changeType: nativeRowChangeType(row),
+        filenames: uniqueStrings(rowFilenames),
+        rowJson: JSON.stringify(row)
+      });
+    }
+
+    const capture = {
+      args: args.slice(),
+      rowsJson: args[1],
+      tagKey,
+      capturedAt: Date.now(),
+      entries,
+      messageIds: uniqueStrings(entries.map((entry) => entry.messageId)),
+      channelIds: uniqueStrings(entries.map((entry) => entry.channelId)),
+      filenames: uniqueStrings(filenames),
+      argumentTypes: args.map(nativeArgumentType),
+      replaySafeArguments: nativeArgumentsAreReplaySafe(args)
+    };
+
+    nativeMediaCaptures = [
+      capture,
+      ...nativeMediaCaptures.filter((item) =>
+        item.args?.[0] !== capture.args[0] || item.rowsJson !== capture.rowsJson
+      )
+    ].slice(0, MAX_NATIVE_MEDIA_CAPTURES);
+
+    lastNativeCapture = [
+      `capturedAt=${new Date(capture.capturedAt).toISOString()}`,
+      `rows=${rows.length}`,
+      `mediaRows=${mediaRows.length}`,
+      `messageIds=${capture.messageIds.join(",") || "<not exposed>"}`,
+      `channelIds=${capture.channelIds.join(",") || "<not exposed>"}`,
+      `filenames=${capture.filenames.join(",") || "<none>"}`,
+      `changeTypes=${capture.entries.map((entry) => entry.changeType ?? "<missing>").join(",") || "<none>"}`,
+      `argTypes=${capture.argumentTypes.join(",")}`,
+      `replaySafe=${capture.replaySafeArguments}`
+    ].join(" ");
+  }
+
+  function matchingCapturedRow(capture, target) {
+    const messageId = stringId(target?.messageId);
+    const filename = attachmentFilename(target);
+    if (!messageId || !filename || !capture.replaySafeArguments) return null;
+    if (Date.now() - capture.capturedAt > MAX_NATIVE_CAPTURE_AGE_MS) return null;
+
+    const channelId = stringId(target?.channelId);
+    return capture.entries.find((entry) =>
+      entry.messageId === messageId &&
+      entry.changeType === 2 &&
+      entry.filenames.includes(filename) &&
+      (!channelId || !entry.channelId || entry.channelId === channelId)
+    ) || null;
+  }
+
+  function replayCapturedNativeRows(target) {
+    nativeReplayAttempts++;
+    const manager = RN.NativeModules?.DCDChatManager;
+    if (!manager || typeof manager.updateRows !== "function") {
+      lastNativeReplay = "Skipped: DCDChatManager.updateRows is unavailable.";
+      return false;
+    }
+    if (!nativeClearRowsGuardActive) {
+      lastNativeReplay = "Skipped: clearRows invalidation guard is unavailable.";
+      return false;
+    }
+
+    let capture = null;
+    let capturedRow = null;
+    for (const item of nativeMediaCaptures) {
+      const row = matchingCapturedRow(item, target);
+      if (!row) continue;
+      capture = item;
+      capturedRow = row;
+      break;
+    }
+    if (!capture || !capturedRow) {
+      const freshCount = nativeMediaCaptures.filter((item) =>
+        Date.now() - item.capturedAt <= MAX_NATIVE_CAPTURE_AGE_MS
+      ).length;
+      const safeCount = nativeMediaCaptures.filter((item) => item.replaySafeArguments).length;
+      lastNativeReplay = `Skipped: no recent direct media row matched message ${target?.messageId || "<none>"} and filename ${attachmentFilename(target) || "<none>"}. Fresh captures=${freshCount}. Replay-safe captures=${safeCount}.`;
+      return false;
+    }
+
+    const ageMs = Date.now() - capture.capturedAt;
+    const latest = latestNativeArgsByTag.get(capture.tagKey);
+    if (!latest || Date.now() - latest.updatedAt > MAX_NATIVE_CAPTURE_AGE_MS) {
+      lastNativeReplay = `Skipped: latest native arguments for ${capture.tagKey} are stale or missing.`;
+      return false;
+    }
+    if (latest.args.length !== 7 || latest.args[6] !== false) {
+      lastNativeReplay = `Skipped: latest native call was not an explicit seven-argument non-reload update. argsLength=${latest.args.length} forceReload=${String(latest.args[6])}`;
+      return false;
+    }
+    const replayArgs = latest.args.slice();
+    replayArgs[1] = `[${capturedRow.rowJson}]`;
+    replayArgs[3] = null;
+    replayingNativeRows = true;
+    try {
+      manager.updateRows.apply(manager, replayArgs);
+      nativeReplaySubmissions++;
+      lastNativeReplay = `Submitted one matching changeType=2 native media row without stale scroll data. ageMs=${ageMs} messageId=${target.messageId} filename=${attachmentFilename(target)}`;
+      return true;
+    } catch (error) {
+      lastNativeReplay = `Native replay failed: ${String(error)}`;
+      return false;
+    } finally {
+      replayingNativeRows = false;
+    }
+  }
+
   function installPatch() {
     const rowModule = findByProps(["generateMessageRowData"]);
     if (!rowModule || typeof rowModule.generateMessageRowData !== "function") {
@@ -295,6 +508,34 @@
     logger.log("[HideMediaEverywhere]", storage.patchStatus);
   }
 
+  function installNativeClearRowsPatch(manager) {
+    if (unpatchNativeClearRows) return true;
+    nativeClearRowsGuardActive = false;
+    if (typeof manager?.clearRows !== "function") {
+      storage.nativeClearRowsGuardStatus = `DCDChatManager.clearRows unavailable. Keys: ${keysOf(manager).join(", ") || "<none>"}`;
+      return false;
+    }
+    if (typeof vendetta.patcher?.before !== "function") {
+      storage.nativeClearRowsGuardStatus = "patcher.before unavailable for DCDChatManager.clearRows.";
+      return false;
+    }
+
+    try {
+      unpatchNativeClearRows = vendetta.patcher.before("clearRows", manager, (args) => {
+        nativeClearRowsCalls++;
+        const tagKey = nativeTagKey(args?.[0]);
+        invalidateNativeCapturesForTag(tagKey, "Native clearRows invalidated this chat tag");
+        if (tagKey) latestNativeArgsByTag.delete(tagKey);
+      });
+      nativeClearRowsGuardActive = true;
+      storage.nativeClearRowsGuardStatus = "Active. Invalidating captured rows when the native chat tag clears.";
+      return true;
+    } catch (error) {
+      storage.nativeClearRowsGuardStatus = `DCDChatManager.clearRows patch failed: ${String(error)}`;
+      return false;
+    }
+  }
+
   function installNativeRowsPatch() {
     if (unpatchNativeRows) return;
     try {
@@ -308,12 +549,13 @@
         return;
       }
 
+      installNativeClearRowsPatch(manager);
+
       unpatchNativeRows = vendetta.patcher.before("updateRows", manager, (args) => {
         nativeUpdateRowsCalls++;
-        lastNativeInvocation = `call=${nativeUpdateRowsCalls} argsLength=${args?.length ?? 0} arg0Type=${typeof args?.[0]} arg1Type=${typeof args?.[1]}`;
+        const invocationKind = replayingNativeRows ? "replay" : "natural";
+        lastNativeInvocation = `call=${nativeUpdateRowsCalls} kind=${invocationKind} argsLength=${args?.length ?? 0} argTypes=${Array.isArray(args) ? args.map(nativeArgumentType).join(",") : "<not-array>"}`;
         try {
-          const blocked = readBlocked();
-          if (!storage.hideAllAttachments && blocked.size === 0) return;
           if (typeof args?.[1] !== "string") {
             storage.nativePatchStatus = `DCDChatManager.updateRows rows argument was ${typeof args?.[1]}, not a string.`;
             return;
@@ -330,13 +572,50 @@
             return;
           }
 
-          let mediaRows = 0;
+          const tagKey = nativeTagKey(args[0]);
+          const replaySafeArguments = nativeArgumentsAreReplaySafe(args);
+          if (!replayingNativeRows && tagKey) {
+            if (replaySafeArguments) {
+              latestNativeArgsByTag.set(tagKey, { args: args.slice(), updatedAt: Date.now() });
+            } else {
+              invalidateNativeCapturesForTag(tagKey, "An incompatible native update invalidated this chat tag");
+              latestNativeArgsByTag.delete(tagKey);
+            }
+          }
+
+          if (!replayingNativeRows && tagKey) {
+            const structuralChange = rows.some((row) => {
+              const changeType = nativeRowChangeType(row);
+              return changeType === 1 || changeType === 3;
+            });
+            if (structuralChange) {
+              invalidateNativeCapturesForTag(tagKey, "A later native insert/delete invalidated this chat tag");
+            } else {
+              const changedMessageIds = uniqueStrings(rows.map(nativeRowMessageId));
+              if (changedMessageIds.length > 0) {
+                invalidateNativeCapturesForTag(tagKey, "A newer native row replaced the captured target", changedMessageIds);
+              }
+            }
+          }
+
+          const mediaRows = rows.filter((row) =>
+            Array.isArray(row?.message?.attachments) && row.message.attachments.length > 0
+          );
+          if (mediaRows.length === 0) return;
+
+          captureNativeMediaBatch(args, rows, mediaRows);
+          storage.nativeMediaBatchCount = (storage.nativeMediaBatchCount || 0) + 1;
+          if (replayingNativeRows) {
+            storage.nativeReplayMediaBatchCount = (storage.nativeReplayMediaBatchCount || 0) + 1;
+          } else {
+            storage.nativeNaturalMediaBatchCount = (storage.nativeNaturalMediaBatchCount || 0) + 1;
+          }
+
+          const blocked = readBlocked();
           let attachmentsSeen = 0;
           let removed = 0;
-          for (const row of rows) {
-            const attachments = row?.message?.attachments;
-            if (!Array.isArray(attachments) || attachments.length === 0) continue;
-            mediaRows++;
+          for (const row of mediaRows) {
+            const attachments = row.message.attachments;
             attachmentsSeen += attachments.length;
             const visible = attachments.filter((attachment) => !shouldHideAttachment(attachment, blocked));
             removed += attachments.length - visible.length;
@@ -353,25 +632,22 @@
             args[1] = JSON.stringify(rows);
             storage.nativeReplacementCount = (storage.nativeReplacementCount || 0) + removed;
           }
-          if (mediaRows > 0) {
-            storage.nativeMediaBatchCount = (storage.nativeMediaBatchCount || 0) + 1;
-            storage.latestNativeReport = [
-              `native update ${new Date().toISOString()}`,
-              lastNativeInvocation,
-              `rows=${rows.length}`,
-              `mediaRows=${mediaRows}`,
-              `attachmentsSeen=${attachmentsSeen}`,
-              `hideAllAttachments=${!!storage.hideAllAttachments}`,
-              `blockedKeys=${[...blocked].join(", ") || "<none>"}`,
-              `nativeRemoved=${removed}`
-            ].join("\n");
-          }
+          storage.latestNativeReport = [
+            `native update ${new Date().toISOString()}`,
+            lastNativeInvocation,
+            `rows=${rows.length}`,
+            `mediaRows=${mediaRows.length}`,
+            `attachmentsSeen=${attachmentsSeen}`,
+            `hideAllAttachments=${!!storage.hideAllAttachments}`,
+            `blockedKeys=${[...blocked].join(", ") || "<none>"}`,
+            `nativeRemoved=${removed}`
+          ].join("\n");
         } catch (error) {
           storage.nativePatchStatus = `DCDChatManager.updateRows filter failed: ${String(error)}`;
         }
       });
 
-      storage.nativePatchStatus = "Active. Filtering serialized rows before the mounted iOS chat view.";
+      storage.nativePatchStatus = "Active. Capturing original media batches and filtering serialized rows before the mounted iOS chat view.";
     } catch (error) {
       storage.nativePatchStatus = `DCDChatManager.updateRows patch failed: ${String(error)}`;
     }
@@ -383,21 +659,26 @@
     if (blocked.has(key)) blocked.delete(key);
     else blocked.add(key);
     writeBlocked(blocked);
-    requestMessageRefresh();
+    requestMessageRefresh(item);
   }
 
-  function requestMessageRefresh() {
+  function requestMessageRefresh(targetHint) {
     installNativeRowsPatch();
     storage.refreshCount = (storage.refreshCount || 0) + 1;
     storage.refreshTarget = "<none>";
     storage.refreshMessageFound = false;
+    storage.refreshNativeReplayed = false;
     storage.refreshDispatchError = "";
 
     try {
-      const target = readRecent().find((item) =>
+      const target = (targetHint &&
+        typeof targetHint.channelId === "string" && targetHint.channelId &&
+        typeof targetHint.messageId === "string" && targetHint.messageId
+          ? targetHint
+          : readRecent().find((item) =>
         typeof item?.channelId === "string" && item.channelId &&
         typeof item?.messageId === "string" && item.messageId
-      );
+      ));
       if (!target) {
         storage.refreshStatus = "No captured media message is available for refresh.";
         return;
@@ -420,23 +701,32 @@
         return;
       }
 
+      const targetFilename = attachmentFilename(target);
+      if (!targetFilename || !freshMessage.attachments.some((attachment) => attachmentFilename(attachment) === targetFilename)) {
+        storage.refreshStatus = "Newest captured attachment no longer exists on the live MessageStore message.";
+        return;
+      }
+
       const dispatcher = metro.common?.FluxDispatcher ?? findByProps(["dispatch", "subscribe", "unsubscribe"]);
       if (typeof dispatcher?.dispatch !== "function") {
         storage.refreshStatus = "FluxDispatcher.dispatch is unavailable.";
         return;
       }
 
+      const nativeReplayed = replayCapturedNativeRows(target);
+      storage.refreshNativeReplayed = nativeReplayed;
+
       const updateMessage = cloneWithOverrides(freshMessage, {
         id: target.messageId,
         channel_id: target.channelId,
         attachments: freshMessage.attachments.slice()
       });
-      storage.refreshStatus = "Queued one local MESSAGE_UPDATE for the newest captured media message.";
+      storage.refreshStatus = `${nativeReplayed ? "Submitted one guarded native media-row update. " : ""}Queued one local MESSAGE_UPDATE for the newest captured media message.`;
       Promise.resolve()
         .then(() => dispatcher.dispatch({ type: "MESSAGE_UPDATE", message: updateMessage }))
         .then(
           () => {
-            storage.refreshStatus = "Dispatched one local MESSAGE_UPDATE for the newest captured media message.";
+            storage.refreshStatus = `${nativeReplayed ? "Submitted one guarded native media-row update and dispatched" : "Dispatched"} one local MESSAGE_UPDATE for the newest captured media message.`;
           },
           (error) => {
             storage.refreshDispatchError = String(error);
@@ -518,16 +808,27 @@
           onPress: () => {
             const menuReport = "Skipped in the focused row-refresh build.";
             RN.Clipboard.setString([
-              `HideMediaEverywhere 1.3.0`,
+              `HideMediaEverywhere 1.4.0`,
               `Known-good renderer baseline: 487003a`,
               `Row calls: ${storage.rowCallCount || 0}`,
               `Media rows: ${storage.mediaRowCount || 0}`,
               `Replaced attachments: ${storage.replacementCount || 0}`,
               `Native row patch: ${storage.nativePatchStatus || "not installed"}`,
+              `Native clearRows guard: ${storage.nativeClearRowsGuardStatus || "not installed"}`,
               `Native updateRows calls: ${nativeUpdateRowsCalls}`,
+              `Native clearRows calls: ${nativeClearRowsCalls}`,
               `Last native invocation: ${lastNativeInvocation}`,
               `Native media batches: ${storage.nativeMediaBatchCount || 0}`,
+              `Natural native media batches: ${storage.nativeNaturalMediaBatchCount || 0}`,
+              `Replay native media batches: ${storage.nativeReplayMediaBatchCount || 0}`,
               `Native replaced attachments: ${storage.nativeReplacementCount || 0}`,
+              `Native captures in memory: ${nativeMediaCaptures.length}`,
+              `Native replay attempts: ${nativeReplayAttempts}`,
+              `Native replay submissions: ${nativeReplaySubmissions}`,
+              `Native capture invalidations: ${nativeCaptureInvalidations}`,
+              `Last native capture: ${lastNativeCapture}`,
+              `Last native replay: ${lastNativeReplay}`,
+              `Last native invalidation: ${lastNativeInvalidation}`,
               `Hide-all test: ${storage.hideAllAttachments ? "ON" : "OFF"}`,
               `Refresh target: ${storage.refreshTarget || "<none>"}`,
               `Fresh message found: ${storage.refreshMessageFound ? "yes" : "no"}`,
@@ -561,9 +862,24 @@
   return {
     onLoad() {
       nativeUpdateRowsCalls = 0;
+      nativeClearRowsCalls = 0;
       lastNativeInvocation = "No DCDChatManager.updateRows call captured yet.";
+      nativeMediaCaptures = [];
+      latestNativeArgsByTag = new Map();
+      replayingNativeRows = false;
+      nativeReplayAttempts = 0;
+      nativeReplaySubmissions = 0;
+      nativeCaptureInvalidations = 0;
+      nativeClearRowsGuardActive = false;
+      lastNativeCapture = "No native media batch captured yet.";
+      lastNativeReplay = "No native media replay attempted yet.";
+      lastNativeInvalidation = "No native media capture invalidated yet.";
       storage.hideAllAttachments = false;
       storage.replacementCount = 0;
+      storage.nativeMediaBatchCount = 0;
+      storage.nativeNaturalMediaBatchCount = 0;
+      storage.nativeReplayMediaBatchCount = 0;
+      storage.nativeReplacementCount = 0;
       installPatch();
       installNativeRowsPatch();
     },
@@ -576,6 +892,14 @@
           unpatchNativeRows?.();
         } finally {
           unpatchNativeRows = null;
+          try {
+            unpatchNativeClearRows?.();
+          } finally {
+            unpatchNativeClearRows = null;
+            nativeClearRowsGuardActive = false;
+            nativeMediaCaptures = [];
+            latestNativeArgsByTag = new Map();
+          }
         }
       }
     },
