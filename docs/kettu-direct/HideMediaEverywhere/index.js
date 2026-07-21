@@ -5,6 +5,9 @@
   const storage = vendetta.plugin.storage;
   const logger = vendetta.logger;
   let unpatchRowData = null;
+  let unpatchNativeRows = null;
+  let nativeUpdateRowsCalls = 0;
+  let lastNativeInvocation = "No DCDChatManager.updateRows call captured yet.";
 
   function keysOf(value) {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return [];
@@ -292,6 +295,88 @@
     logger.log("[HideMediaEverywhere]", storage.patchStatus);
   }
 
+  function installNativeRowsPatch() {
+    if (unpatchNativeRows) return;
+    try {
+      const manager = RN.NativeModules?.DCDChatManager;
+      if (!manager || typeof manager.updateRows !== "function") {
+        storage.nativePatchStatus = `DCDChatManager.updateRows unavailable. Keys: ${keysOf(manager).join(", ") || "<none>"}`;
+        return;
+      }
+      if (typeof vendetta.patcher?.before !== "function") {
+        storage.nativePatchStatus = "patcher.before unavailable for DCDChatManager.updateRows.";
+        return;
+      }
+
+      unpatchNativeRows = vendetta.patcher.before("updateRows", manager, (args) => {
+        nativeUpdateRowsCalls++;
+        lastNativeInvocation = `call=${nativeUpdateRowsCalls} argsLength=${args?.length ?? 0} arg0Type=${typeof args?.[0]} arg1Type=${typeof args?.[1]}`;
+        try {
+          const blocked = readBlocked();
+          if (!storage.hideAllAttachments && blocked.size === 0) return;
+          if (typeof args?.[1] !== "string") {
+            storage.nativePatchStatus = `DCDChatManager.updateRows rows argument was ${typeof args?.[1]}, not a string.`;
+            return;
+          }
+
+          const refreshTarget = String(storage.refreshTarget || "");
+          const targetSeparator = refreshTarget.indexOf(":");
+          const targetMessageId = targetSeparator === -1 ? "" : refreshTarget.slice(targetSeparator + 1);
+          const batchHasRefreshTarget = !!targetMessageId && args[1].includes(targetMessageId);
+          lastNativeInvocation += ` batchHasRefreshTarget=${batchHasRefreshTarget}`;
+          const rows = JSON.parse(args[1]);
+          if (!Array.isArray(rows)) {
+            storage.nativePatchStatus = "DCDChatManager.updateRows payload was not an array.";
+            return;
+          }
+
+          let mediaRows = 0;
+          let attachmentsSeen = 0;
+          let removed = 0;
+          for (const row of rows) {
+            const attachments = row?.message?.attachments;
+            if (!Array.isArray(attachments) || attachments.length === 0) continue;
+            mediaRows++;
+            attachmentsSeen += attachments.length;
+            const visible = attachments.filter((attachment) => !shouldHideAttachment(attachment, blocked));
+            removed += attachments.length - visible.length;
+            if (visible.length !== attachments.length) {
+              row.message.attachments = visible;
+              if (visible.length === 0) {
+                row.message.useAttachmentGridLayout = false;
+                row.message.useAttachmentUploadPreview = false;
+              }
+            }
+          }
+
+          if (removed > 0) {
+            args[1] = JSON.stringify(rows);
+            storage.nativeReplacementCount = (storage.nativeReplacementCount || 0) + removed;
+          }
+          if (mediaRows > 0) {
+            storage.nativeMediaBatchCount = (storage.nativeMediaBatchCount || 0) + 1;
+            storage.latestNativeReport = [
+              `native update ${new Date().toISOString()}`,
+              lastNativeInvocation,
+              `rows=${rows.length}`,
+              `mediaRows=${mediaRows}`,
+              `attachmentsSeen=${attachmentsSeen}`,
+              `hideAllAttachments=${!!storage.hideAllAttachments}`,
+              `blockedKeys=${[...blocked].join(", ") || "<none>"}`,
+              `nativeRemoved=${removed}`
+            ].join("\n");
+          }
+        } catch (error) {
+          storage.nativePatchStatus = `DCDChatManager.updateRows filter failed: ${String(error)}`;
+        }
+      });
+
+      storage.nativePatchStatus = "Active. Filtering serialized rows before the mounted iOS chat view.";
+    } catch (error) {
+      storage.nativePatchStatus = `DCDChatManager.updateRows patch failed: ${String(error)}`;
+    }
+  }
+
   function toggleRecent(item) {
     const blocked = readBlocked();
     const key = globalAttachmentKey(item.filename);
@@ -302,6 +387,7 @@
   }
 
   function requestMessageRefresh() {
+    installNativeRowsPatch();
     storage.refreshCount = (storage.refreshCount || 0) + 1;
     storage.refreshTarget = "<none>";
     storage.refreshMessageFound = false;
@@ -387,7 +473,7 @@
       React.createElement(
         RN.Text,
         { style: styles.note },
-        `${storage.patchStatus || "Patch not installed"}\n${blocked.size} selected filename${blocked.size === 1 ? "" : "s"}. Row calls: ${storage.rowCallCount || 0}. Media rows: ${storage.mediaRowCount || 0}. Replaced attachments: ${storage.replacementCount || 0}. Hide-all test: ${storage.hideAllAttachments ? "ON" : "OFF"}.\n${storage.refreshStatus || "No refresh requested yet."}`
+        `${storage.patchStatus || "Patch not installed"}\n${storage.nativePatchStatus || "Native row patch not installed."}\n${blocked.size} selected filename${blocked.size === 1 ? "" : "s"}. Row calls: ${storage.rowCallCount || 0}. Media rows: ${storage.mediaRowCount || 0}. Replaced attachments: ${storage.replacementCount || 0}. Native replacements: ${storage.nativeReplacementCount || 0}. Hide-all test: ${storage.hideAllAttachments ? "ON" : "OFF"}.\n${storage.refreshStatus || "No refresh requested yet."}`
       ),
       React.createElement(
         RN.Text,
@@ -432,17 +518,23 @@
           onPress: () => {
             const menuReport = "Skipped in the focused row-refresh build.";
             RN.Clipboard.setString([
-              `HideMediaEverywhere 1.2.0`,
+              `HideMediaEverywhere 1.3.0`,
               `Known-good renderer baseline: 487003a`,
               `Row calls: ${storage.rowCallCount || 0}`,
               `Media rows: ${storage.mediaRowCount || 0}`,
               `Replaced attachments: ${storage.replacementCount || 0}`,
+              `Native row patch: ${storage.nativePatchStatus || "not installed"}`,
+              `Native updateRows calls: ${nativeUpdateRowsCalls}`,
+              `Last native invocation: ${lastNativeInvocation}`,
+              `Native media batches: ${storage.nativeMediaBatchCount || 0}`,
+              `Native replaced attachments: ${storage.nativeReplacementCount || 0}`,
               `Hide-all test: ${storage.hideAllAttachments ? "ON" : "OFF"}`,
               `Refresh target: ${storage.refreshTarget || "<none>"}`,
               `Fresh message found: ${storage.refreshMessageFound ? "yes" : "no"}`,
               storage.refreshStatus || "No refresh requested yet.",
               `Refresh dispatch error: ${storage.refreshDispatchError || "<none>"}`,
               storage.latestMatchReport || "No media match report yet.",
+              storage.latestNativeReport || "No native media-row report yet.",
               "",
               "Native menu discovery:",
               menuReport
@@ -468,15 +560,23 @@
 
   return {
     onLoad() {
+      nativeUpdateRowsCalls = 0;
+      lastNativeInvocation = "No DCDChatManager.updateRows call captured yet.";
       storage.hideAllAttachments = false;
       storage.replacementCount = 0;
       installPatch();
+      installNativeRowsPatch();
     },
     onUnload() {
       try {
         unpatchRowData?.();
       } finally {
         unpatchRowData = null;
+        try {
+          unpatchNativeRows?.();
+        } finally {
+          unpatchNativeRows = null;
+        }
       }
     },
     settings: Settings
