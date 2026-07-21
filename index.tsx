@@ -544,6 +544,7 @@ function addCurtain(cover: HTMLElement, reveal: RevealSource, dims?: Placeholder
         cover.style.justifyContent = "center";
         cover.style.background = "var(--background-secondary)";
     }
+    cover.style.zIndex = "0";
 
     const handle = document.createElement("div");
     handle.className = CURTAIN_HANDLE_CLASS;
@@ -551,6 +552,7 @@ function addCurtain(cover: HTMLElement, reveal: RevealSource, dims?: Placeholder
     wrapper.append(cover, handle);
 
     let revealEl: HTMLElement | null = null;
+    let revealFrame: HTMLElement | null = null;
     let revealPx = 0;
     let startY   = 0;
     let startPx  = 0;
@@ -562,7 +564,7 @@ function addCurtain(cover: HTMLElement, reveal: RevealSource, dims?: Placeholder
     const HANDLE_H = 18;
     let atBottomState: boolean | null = null;
     const apply = () => {
-        cover.style.transform = `translateY(${revealPx}px)`;
+        if (revealFrame) revealFrame.style.height = `${revealPx}px`;
         const maxTop = (height || wrapper.clientHeight) - HANDLE_H;
         const top    = Math.max(0, Math.min(revealPx, maxTop));
         handle.style.top = `${top}px`;
@@ -610,7 +612,16 @@ function addCurtain(cover: HTMLElement, reveal: RevealSource, dims?: Placeholder
             revealEl = v;
         }
         revealEl.className = CURTAIN_REVEAL_CLASS;
-        wrapper.insertBefore(revealEl, cover);
+        revealEl.style.height = `${size.h}px`;
+
+        revealFrame = document.createElement("div");
+        revealFrame.style.position = "absolute";
+        revealFrame.style.inset = "0 0 auto";
+        revealFrame.style.height = `${revealPx}px`;
+        revealFrame.style.overflow = "hidden";
+        revealFrame.style.zIndex = "1";
+        revealFrame.appendChild(revealEl);
+        wrapper.insertBefore(revealFrame, handle);
     };
 
     handle.addEventListener("pointerdown", e => {
