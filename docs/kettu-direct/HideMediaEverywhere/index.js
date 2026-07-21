@@ -5,6 +5,7 @@
   const storage = vendetta.plugin.storage;
   const logger = vendetta.logger;
   let unpatchRowData = null;
+  let unpatchContextMenus = [];
 
   function keysOf(value) {
     if ((typeof value !== "object" && typeof value !== "function") || value === null) return [];
@@ -21,6 +22,17 @@
       return metro.find(metro.filters.byProps(...props));
     }
     return undefined;
+  }
+
+  function findAllByProps(props) {
+    if (typeof metro.findByPropsAll === "function") {
+      try {
+        const matches = metro.findByPropsAll(...props);
+        if (Array.isArray(matches)) return matches.filter(Boolean);
+      } catch { }
+    }
+    const match = findByProps(props);
+    return match ? [match] : [];
   }
 
   function unwrapModule(record) {
@@ -72,7 +84,13 @@
     try {
       for (const [id, record] of Object.entries(metro.modules || {})) {
         scanned++;
-        const exports = unwrapModule(record);
+        let exports;
+        try {
+          exports = unwrapModule(record);
+        } catch (error) {
+          lines.push(`${id}: module unwrap error=${String(error)}`);
+          continue;
+        }
         const candidates = [["<exports>", exports], ["default", exports?.default]];
         for (const key of keysOf(exports).slice(0, 160)) {
           let value;
@@ -108,7 +126,7 @@
           pattern.lastIndex = 0;
           const snippet = sourceMatchSnippet(source, pattern);
           if (!keyHit && !snippet) continue;
-          moduleLines.push(`${key}: type=${typeof value} name=${display || "<none>"} keys=${keysOf(value).slice(0, 50).join(",") || "<none>"}${snippet ? ` source=${snippet}` : ""}`);
+          moduleLines.push(`${key}: type=${typeof value} name=${display || "<none>"} keys=${keysOf(value).slice(0, 50).join(",") || "<none>"} prototype=${keysOf(value?.prototype).slice(0, 80).join(",") || "<none>"}${snippet ? ` source=${snippet}` : ""}`);
         }
         if (!moduleLines.length) continue;
         lines.push(`${id}: exports=${keysOf(exports).slice(0, 100).join(",") || "<none>"}`);
@@ -125,6 +143,74 @@
     lines.push(`scanned=${scanned} matched=${matched}`);
     storage.menuDiscoveryReport = lines.join("\n");
     return storage.menuDiscoveryReport;
+  }
+
+  function findMessagePaths(value, path, depth, seen, output) {
+    if (!value || depth > 5 || (typeof value !== "object" && typeof value !== "function") || output.length >= 60) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    const keys = keysOf(value);
+    if (!Array.isArray(value) && (
+      typeof value.id === "string"
+      || typeof value.channel_id === "string"
+      || Array.isArray(value.attachments)
+      || Array.isArray(value.embeds)
+    )) {
+      output.push(`${path}: keys=${keys.slice(0, 80).join(",") || "<none>"} id=${String(value.id || "<none>")} channel=${String(value.channel_id || value.channelId || "<none>")} attachments=${Array.isArray(value.attachments) ? value.attachments.length : "n/a"} embeds=${Array.isArray(value.embeds) ? value.embeds.length : "n/a"}`);
+    }
+    if (Array.isArray(value)) {
+      for (let index = 0; index < Math.min(value.length, 30); index++) {
+        findMessagePaths(value[index], `${path}[${index}]`, depth + 1, seen, output);
+      }
+      return;
+    }
+    for (const key of keys.slice(0, 100)) {
+      let child;
+      try {
+        child = value[key];
+      } catch {
+        continue;
+      }
+      findMessagePaths(child, `${path}.${key}`, depth + 1, seen, output);
+    }
+  }
+
+  function describeContextMenuCall(method, args) {
+    const paths = [];
+    findMessagePaths(args, "args", 0, new Set(), paths);
+    return [
+      `context menu ${new Date().toISOString()}`,
+      `method=${method}`,
+      `argCount=${Array.isArray(args) ? args.length : "n/a"}`,
+      ...Array.from({ length: Math.min(args?.length || 0, 8) }, (_, index) => {
+        const value = args[index];
+        return `arg[${index}]: type=${Array.isArray(value) ? "array" : typeof value} name=${typeof value === "function" ? value.displayName || value.name || "anonymous" : "<none>"} value=${typeof value === "string" ? value : "<non-string>"} keys=${keysOf(value).slice(0, 100).join(",") || "<none>"}`;
+      }),
+      "message-like paths:",
+      ...(paths.length ? paths : ["<none>"])
+    ].join("\n");
+  }
+
+  function saveContextMenuCall(method, args) {
+    let reports;
+    try {
+      reports = JSON.parse(storage.contextMenuReports || "[]");
+      if (!Array.isArray(reports)) reports = [];
+    } catch {
+      reports = [];
+    }
+    reports.unshift(describeContextMenuCall(method, args));
+    storage.contextMenuReports = JSON.stringify(reports.slice(0, 8));
+    storage.contextMenuCaptureCount = (storage.contextMenuCaptureCount || 0) + 1;
+  }
+
+  function readContextMenuReports() {
+    try {
+      const reports = JSON.parse(storage.contextMenuReports || "[]");
+      return Array.isArray(reports) ? reports : [];
+    } catch {
+      return [];
+    }
   }
 
   function filenameFromUrl(url) {
@@ -290,6 +376,42 @@
     logger.log("[HideMediaEverywhere]", storage.patchStatus);
   }
 
+  function installContextMenuProbe() {
+    if (typeof vendetta.patcher?.before !== "function") {
+      storage.contextMenuProbeStatus = "patcher.before is unavailable.";
+      return;
+    }
+    const groups = [
+      [findAllByProps(["showContextMenu", "hideContextMenu"]), ["showContextMenu"]],
+      [findAllByProps(["openContextMenu", "openContextMenuLazy", "closeContextMenu"]), ["openContextMenu", "openContextMenuLazy"]]
+    ];
+    const seen = new Set();
+    const installed = [];
+    for (const [modules, methods] of groups) {
+      for (const module of modules) {
+        for (const method of methods) {
+          if (!module || typeof module[method] !== "function" || seen.has(module[method])) continue;
+          seen.add(module[method]);
+          try {
+            unpatchContextMenus.push(vendetta.patcher.before(method, module, (args) => {
+              try {
+                saveContextMenuCall(method, args);
+              } catch (error) {
+                storage.contextMenuProbeError = `${method} capture error: ${String(error)}`;
+              }
+            }));
+            installed.push(method);
+          } catch (error) {
+            storage.contextMenuProbeError = `${method} patch error: ${String(error)}`;
+          }
+        }
+      }
+    }
+    storage.contextMenuProbeStatus = installed.length
+      ? `Observing ${installed.join(" + ")} without changing calls.`
+      : "No JavaScript context-menu entry point was patchable.";
+  }
+
   function toggleRecent(item) {
     const blocked = readBlocked();
     const key = globalAttachmentKey(item.filename);
@@ -386,7 +508,7 @@
           onPress: () => {
             const menuReport = scanMenuModules();
             RN.Clipboard.setString([
-              `HideMediaEverywhere 0.9.0`,
+              `HideMediaEverywhere 1.0.0`,
               `Known-good renderer baseline: 487003a`,
               `Row calls: ${storage.rowCallCount || 0}`,
               `Media rows: ${storage.mediaRowCount || 0}`,
@@ -396,7 +518,15 @@
               storage.latestMatchReport || "No media match report yet.",
               "",
               "Native menu discovery:",
-              menuReport
+              menuReport,
+              "",
+              "Context-menu probe:",
+              storage.contextMenuProbeStatus || "Probe not installed.",
+              `Captures: ${storage.contextMenuCaptureCount || 0}`,
+              storage.contextMenuProbeError || "No context-menu probe errors.",
+              ...(readContextMenuReports().length
+                ? readContextMenuReports().flatMap((report, index) => ["", `Capture ${index + 1}:`, report])
+                : ["No context-menu call captured yet."])
             ].join("\n"));
           }
         },
@@ -421,13 +551,19 @@
     onLoad() {
       storage.hideAllAttachments = false;
       storage.replacementCount = 0;
+      storage.contextMenuCaptureCount = 0;
+      storage.contextMenuReports = "[]";
+      storage.contextMenuProbeError = "";
       installPatch();
+      installContextMenuProbe();
     },
     onUnload() {
       try {
         unpatchRowData?.();
+        for (const unpatch of unpatchContextMenus) unpatch?.();
       } finally {
         unpatchRowData = null;
+        unpatchContextMenus = [];
       }
     },
     settings: Settings

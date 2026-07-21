@@ -7,7 +7,7 @@
       "id": "738215409559404562"
     }
   ],
-  "version": "0.9.0",
-  "hash": "64ef1de0ed5b05c98fc621d50dcd3b7c8da70d4966778ac5d885bfbcb6d30271",
+  "version": "1.0.0",
+  "hash": "ff0d6bf7efd7ece768d0fd324dd4794acfb5e99f14b3fbf0aa14cb15fa497b26",
   "main": "index.js"
 }
