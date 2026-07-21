@@ -302,12 +302,12 @@
   function requestMessageRefresh() {
     try {
       const messageStore = findByProps(["getMessage", "getMessages"]);
-      if (typeof messageStore?.emitChange === "function") {
-        messageStore.emitChange();
-        storage.refreshStatus = "Requested a message-store refresh with emitChange.";
-      } else if (typeof messageStore?.doEmitChanges === "function") {
+      if (typeof messageStore?.doEmitChanges === "function") {
         messageStore.doEmitChanges();
         storage.refreshStatus = "Requested a message-store refresh with doEmitChanges.";
+      } else if (typeof messageStore?.emitChange === "function") {
+        messageStore.emitChange();
+        storage.refreshStatus = "Requested a message-store refresh with emitChange.";
       } else {
         storage.refreshStatus = "Message-store refresh method was unavailable.";
       }
@@ -386,7 +386,7 @@
           onPress: () => {
             const menuReport = scanMenuModules();
             RN.Clipboard.setString([
-              `HideMediaEverywhere 1.0.1`,
+              `HideMediaEverywhere 1.0.2`,
               `Known-good renderer baseline: 487003a`,
               `Row calls: ${storage.rowCallCount || 0}`,
               `Media rows: ${storage.mediaRowCount || 0}`,
