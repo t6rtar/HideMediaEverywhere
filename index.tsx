@@ -195,20 +195,40 @@ function skipOwnImage(url: string, isOwn: boolean): boolean {
 }
 
 
-function makeBlockKey(userId: string, url: string): string {
-    const filename = getFileName(url);
-    return isGifUrl(url) ? filename : `${userId}:${filename}`;
+function makeSignatureKey(urls: string[]): string {
+    const signature = [...new Set(urls.map(cleanUrl))].sort().join("\n");
+    return `v4:${encodeURIComponent(signature)}`;
+}
+
+function makeBlockKeys(channelId: string, urls: string[]): string[] {
+    const isAnimated = urls.some(url => isGifUrl(url) || VIDEO_EXT_RE.test(cleanUrl(url)));
+    if (!isAnimated && urls.every(isImageUrl)) {
+        return [...new Set(urls.map(url => `v4i:${channelId}:${encodeURIComponent(getFileName(url))}`))];
+    }
+    return [makeSignatureKey(urls)];
 }
 
 // avoids splitting the settings string for every image
 let blockedUrlCache = new Set<string>();
-let blockedFilenames = new Set<string>();
+let blockedCanonicalUrls = new Set<string>();
+let activeBlockCount = 0;
 
 function updateBlockedFiles() {
-    blockedFilenames.clear();
+    blockedCanonicalUrls.clear();
+    activeBlockCount = 0;
     for (const key of blockedUrlCache) {
-        const colon = key.indexOf(":");
-        blockedFilenames.add(colon === -1 ? key : key.slice(colon + 1));
+        const match = key.match(/^v4:(.+)$/);
+        if (match) {
+            activeBlockCount++;
+            try {
+                for (const url of decodeURIComponent(match[1]).split("\n"))
+                    if (url) blockedCanonicalUrls.add(url);
+            } catch {}
+            continue;
+        }
+
+        if (/^v4i:[^:]+:.+$/.test(key)) activeBlockCount++;
+
     }
 }
 
@@ -244,21 +264,20 @@ function saveBlockedMedia(keys: Set<string>) {
     updateBlockedFiles();
 }
 
-function isMediaBlocked(userId: string, urls: string[]): boolean {
-    for (const u of urls) if (blockedUrlCache.has(makeBlockKey(userId, u))) return true;
-    return false;
+function isMediaBlocked(channelId: string, urls: string[]): boolean {
+    return urls.length > 0 && makeBlockKeys(channelId, urls).some(key => blockedUrlCache.has(key));
 }
 
-function blockMedia(userId: string, rawUrls: string[]) {
+function blockMedia(channelId: string, rawUrls: string[]) {
     const next = new Set(blockedUrlCache);
-    for (const u of rawUrls) next.add(makeBlockKey(userId, u));
+    for (const key of makeBlockKeys(channelId, rawUrls)) next.add(key);
     saveBlockedMedia(next);
     scanMessages();
 }
 
-function unblockMedia(userId: string, rawUrls: string[]) {
+function unblockMedia(channelId: string, rawUrls: string[]) {
     const next = new Set(blockedUrlCache);
-    for (const u of rawUrls) next.delete(makeBlockKey(userId, u));
+    for (const key of makeBlockKeys(channelId, rawUrls)) next.delete(key);
     saveBlockedMedia(next);
     scanHiddenMessages();
 }
@@ -290,14 +309,12 @@ function getMediaUrls(message: any): string[] {
 }
 
 function hasBlockedMedia(message: any): boolean {
+    const channelId = message?.channel_id ?? message?.channelId;
     const authorId = message?.author?.id;
-    if (!authorId) return false;
+    if (!channelId || !authorId) return false;
     const isOwn = authorId === UserStore.getCurrentUser()?.id;
-    for (const u of getMediaUrls(message)) {
-        if (skipOwnImage(u, isOwn)) continue;
-        if (blockedUrlCache.has(makeBlockKey(authorId, u))) return true;
-    }
-    return false;
+    const urls = getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn));
+    return isMediaBlocked(channelId, urls);
 }
 
 const CHANNEL_CACHE_MAX = 300;
@@ -380,8 +397,9 @@ function getMediaTitle(src: string): string {
 }
 
 function getPlaceholderTitle(message: any): string | undefined {
+    const channelId = message?.channel_id ?? message?.channelId;
     const authorId = message?.author?.id;
-    if (!authorId) return undefined;
+    if (!channelId || !authorId) return undefined;
     const isOwn = authorId === UserStore.getCurrentUser()?.id;
 
     const candidates: string[] = [];
@@ -394,11 +412,10 @@ function getPlaceholderTitle(message: any): string | undefined {
         if (u) candidates.push(u);
     }
 
-    for (const u of candidates) {
-        if (skipOwnImage(u, isOwn)) continue;
-        if (blockedUrlCache.has(makeBlockKey(authorId, u))) return getMediaTitle(u);
-    }
-    return undefined;
+    const visibleCandidates = candidates.filter(u => !skipOwnImage(u, isOwn));
+    return isMediaBlocked(channelId, getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn)))
+        ? visibleCandidates[0] && getMediaTitle(visibleCandidates[0])
+        : undefined;
 }
 
 interface RevealSource { src: string; kind: "image" | "gif" | "video"; nw?: number; nh?: number; poster?: string; }
@@ -409,8 +426,9 @@ interface PlaceholderDims { w: number; h: number; }
 
 // finds the file that goes behind the cover
 function getRevealMedia(message: any): RevealSource | undefined {
+    const channelId = message?.channel_id ?? message?.channelId;
     const authorId = message?.author?.id;
-    if (!authorId) return undefined;
+    if (!channelId || !authorId) return undefined;
 
     const img: ImgCandidate[] = [];
     const gifVid: ImgCandidate[] = [];
@@ -450,13 +468,42 @@ function getRevealMedia(message: any): RevealSource | undefined {
         addImg(embed.thumbnail?.url,       embed.thumbnail?.width, embed.thumbnail?.height);
     }
 
-    const blocked = (u: string) => blockedUrlCache.has(makeBlockKey(authorId, u));
+    const isOwn = authorId === UserStore.getCurrentUser()?.id;
+    const messageBlocked = isMediaBlocked(channelId, getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn)));
+    const blocked = (_u: string) => messageBlocked;
     const pick = (c: ImgCandidate, kind: RevealSource["kind"]): RevealSource => ({ src: c.u, kind, nw: c.w, nh: c.h, poster: c.poster });
 
     for (const c of gifVid)  if (blocked(c.u)) return pick(c, "gif");
     for (const c of vidFile) if (blocked(c.u)) return pick(c, "video");
     for (const c of img)     if (blocked(c.u)) return pick(c, "image");
     return undefined;
+}
+
+function getDomRevealMedia(container: HTMLElement): RevealSource | undefined {
+    const media = container.matches("img,video")
+        ? container as HTMLImageElement | HTMLVideoElement
+        : container.querySelector<HTMLImageElement | HTMLVideoElement>("img,video");
+    if (!media) return undefined;
+
+    const src = media.currentSrc || media.getAttribute("src") || "";
+    if (!src) return undefined;
+
+    if (media instanceof HTMLVideoElement) {
+        return {
+            src,
+            kind: "video",
+            nw: media.videoWidth || undefined,
+            nh: media.videoHeight || undefined,
+            poster: media.poster || undefined
+        };
+    }
+
+    return {
+        src,
+        kind: isGifUrl(src) ? "gif" : "image",
+        nw: media.naturalWidth || undefined,
+        nh: media.naturalHeight || undefined
+    };
 }
 
 const META_MAX_W = 550, META_MAX_H = 350;
@@ -705,7 +752,9 @@ function hideMessageMedia(messageEl: HTMLElement, message?: any) {
     const firstMedia     = hasPlaceholder ? null : messageEl.querySelector<HTMLElement>(MEDIA_SELECTORS);
 
     const title  = !hasPlaceholder && message ? getPlaceholderTitle(message) : undefined;
-    const reveal = !hasPlaceholder && message ? getRevealMedia(message) : undefined;
+    const reveal = !hasPlaceholder && message
+        ? getRevealMedia(message) ?? (firstMedia ? getDomRevealMedia(firstMedia) : undefined)
+        : undefined;
     const nat    = reveal?.nw && reveal?.nh ? { w: reveal.nw, h: reveal.nh } : undefined;
 
     const measured = firstMedia ? measureMedia(firstMedia, nat) : undefined;
@@ -735,14 +784,14 @@ function hideDialogMedia(root: HTMLElement) {
 }
 
 function hidePreviewMedia(root: HTMLElement, inDialog = false) {
-    if (blockedFilenames.size === 0) return;
+    if (blockedCanonicalUrls.size === 0) return;
     for (const el of root.querySelectorAll<HTMLElement>("img,video")) {
         if (el.hasAttribute(PREVIEW_HIDDEN_ATTR)) continue;
         if (el.closest(`.${PLACEHOLDER_CLASS}`)) continue;
         if (!inDialog && el.closest(`[${HIDDEN_ATTR}]`)) continue;
         if (!inDialog && el.closest("[data-list-item-id]")) continue;
         const src = (el as HTMLImageElement).currentSrc || (el as HTMLImageElement).src || el.getAttribute("src") || "";
-        if (!src || !blockedFilenames.has(getFileName(src))) continue;
+        if (!src || !blockedCanonicalUrls.has(cleanUrl(src))) continue;
 
         el.setAttribute(PREVIEW_HIDDEN_ATTR, "");
         const r    = el.getBoundingClientRect();
@@ -756,12 +805,12 @@ function hidePreviewMedia(root: HTMLElement, inDialog = false) {
 const PICKER_CELL_SELECTOR = '[class*="gridItem" i],[class*="result" i],[role="button"],[role="gridcell"]';
 
 function hidePickerMedia(root: HTMLElement) {
-    if (blockedUrlCache.size === 0) return;
+    if (blockedCanonicalUrls.size === 0) return;
     const els = root.matches("img,video") ? [root] : [...root.querySelectorAll<HTMLElement>("img,video")];
     for (const el of els) {
         if (el.hasAttribute(PREVIEW_HIDDEN_ATTR)) continue;
         const src = (el as HTMLImageElement).currentSrc || (el as HTMLImageElement).src || el.getAttribute("src") || "";
-        if (!src || !blockedUrlCache.has(getFileName(src))) continue;
+        if (!src || !blockedCanonicalUrls.has(cleanUrl(src))) continue;
 
         el.setAttribute(PREVIEW_HIDDEN_ATTR, "");
         el.style.visibility = "hidden";
@@ -799,8 +848,8 @@ function checkMessage(messageEl: HTMLElement, allowUnhide = false): boolean {
                 const authorId = message.author?.id ?? "";
                 log("NOT blocked", message.id, "author", authorId, urls.map(u => ({
                     url: u,
-                    key: makeBlockKey(authorId, u),
-                    inCache: blockedUrlCache.has(makeBlockKey(authorId, u))
+                    keys: makeBlockKeys(message.channel_id ?? message.channelId ?? "", urls),
+                    inCache: makeBlockKeys(message.channel_id ?? message.channelId ?? "", urls).some(key => blockedUrlCache.has(key))
                 })));
             }
         }
@@ -831,7 +880,7 @@ function scanHiddenMessages() {
 
 // catches messages and picker rows added after startup
 function checkNewNodes(mutations: MutationRecord[]) {
-    if (blockedUrlCache.size === 0) return;
+    if (activeBlockCount === 0) return;
 
     const toProcess   = new Set<HTMLElement>();
     const dialogsSeen = new Set<HTMLElement>();
@@ -893,15 +942,13 @@ function checkNewNodes(mutations: MutationRecord[]) {
 
 function checkMessageUpdate({ message }: any) {
     if (!message?.id || !message?.channel_id) return;
-    if (blockedUrlCache.size === 0) return;
+    if (activeBlockCount === 0) return;
 
     const authorId = message?.author?.id;
     if (!authorId) return;
 
     const isOwn = authorId === UserStore.getCurrentUser()?.id;
-    const hasBlocked = getMediaUrls(message).some(
-        u => !skipOwnImage(u, isOwn) && blockedUrlCache.has(makeBlockKey(authorId, u))
-    );
+    const hasBlocked = isMediaBlocked(message.channel_id, getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn)));
     if (!hasBlocked) return;
 
     const els = document.querySelectorAll<HTMLElement>(
@@ -971,13 +1018,15 @@ const messageContextPatch: NavContextMenuPatchCallback = (children, props) => {
     const mediaUrls = getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn));
     if (mediaUrls.length === 0) return;
 
-    const blocked = isMediaBlocked(authorId, mediaUrls);
+    const channelId = message.channel_id ?? message.channelId;
+    if (!channelId) return;
+    const blocked = isMediaBlocked(channelId, mediaUrls);
 
     const menuItem = (
         <Menu.MenuItem
             id="vc-hide-gif-toggle"
             label={blocked ? "Unhide this media" : "Hide this media"}
-            action={() => blocked ? unblockMedia(authorId, mediaUrls) : blockMedia(authorId, mediaUrls)}
+            action={() => blocked ? unblockMedia(channelId, mediaUrls) : blockMedia(channelId, mediaUrls)}
         />
     );
 
