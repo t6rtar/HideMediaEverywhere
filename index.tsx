@@ -152,8 +152,18 @@ function cleanUrl(url: string): string {
             } else {
                 result = host + "/" + parts.join("/");
             }
-        } else if (host.includes("tenor.com") && parts.length >= 2) {
-            result = "tenor.com/" + parts[0].replace(/AAA..$/i, "").toLowerCase();
+        } else if (host.includes("tenor.com") && parts.length > 0) {
+            let tenorId: string;
+            if (host === "media.tenor.com") {
+                tenorId = parts[0].replace(/AAA..$/i, "");
+            } else if (parts[0] === "view" && parts[1]) {
+                tenorId = parts[1].match(/(?:gif-)?(\d+)$/i)?.[1] ?? parts[1];
+            } else if (parts[0] === "m" && parts[1]) {
+                tenorId = parts[1];
+            } else {
+                tenorId = parts[0];
+            }
+            result = "tenor.com/" + tenorId.toLowerCase();
         } else if (host.includes("giphy.com") && parts.length >= 2) {
             result = "giphy.com/" + parts[parts.length - 2].toLowerCase();
         } else if (parts[0] === "attachments" && parts.length >= 4) {
@@ -211,10 +221,14 @@ function makeBlockKeys(channelId: string, urls: string[]): string[] {
 // avoids splitting the settings string for every image
 let blockedUrlCache = new Set<string>();
 let blockedCanonicalUrls = new Set<string>();
+let blockedFileNames = new Set<string>();
+let blockedFileNamesByChannel = new Map<string, Set<string>>();
 let activeBlockCount = 0;
 
 function updateBlockedFiles() {
     blockedCanonicalUrls.clear();
+    blockedFileNames.clear();
+    blockedFileNamesByChannel.clear();
     activeBlockCount = 0;
     for (const key of blockedUrlCache) {
         const match = key.match(/^v4:(.+)$/);
@@ -227,32 +241,54 @@ function updateBlockedFiles() {
             continue;
         }
 
-        if (/^v4i:[^:]+:.+$/.test(key)) activeBlockCount++;
+        const imageMatch = key.match(/^v4i:([^:]+):(.+)$/);
+        if (imageMatch) {
+            activeBlockCount++;
+            try {
+                const names = blockedFileNamesByChannel.get(imageMatch[1]) ?? new Set<string>();
+                names.add(decodeURIComponent(imageMatch[2]).toLowerCase());
+                blockedFileNamesByChannel.set(imageMatch[1], names);
+            } catch {}
+            continue;
+        }
 
+        const fileMatch = key.match(/^v4f:(.+)$/);
+        if (fileMatch) {
+            activeBlockCount++;
+            try { blockedFileNames.add(decodeURIComponent(fileMatch[1]).toLowerCase()); } catch {}
+        }
     }
 }
 
-// keeps blocks from older versions working
-function fixOldKey(key: string): string {
-    let prefix = "", rest = key;
-    const colon = key.indexOf(":");
-    if (colon > 0 && /^\d+$/.test(key.slice(0, colon))) { prefix = key.slice(0, colon + 1); rest = key.slice(colon + 1); }
+function removeCoveredBlockKeys(keys: Set<string>): Set<string> {
+    const globalNames = new Set<string>();
+    for (const key of keys) {
+        const match = key.match(/^v4f:(.+)$/);
+        if (!match) continue;
+        try { globalNames.add(decodeURIComponent(match[1]).toLowerCase()); } catch {}
+    }
 
-    // old tenor links
-    let m = rest.match(/tenor\.com\/([^/]+)\/[^/]+$/i);
-    if (m) return prefix + "tenor.com/" + m[1].replace(/aaa..$/i, "").toLowerCase();
+    return new Set([...keys].filter(key => {
+        const imageMatch = key.match(/^v4i:[^:]+:(.+)$/);
+        if (imageMatch) {
+            try { return !globalNames.has(decodeURIComponent(imageMatch[1]).toLowerCase()); } catch { return true; }
+        }
 
-    // old giphy links
-    m = rest.match(/giphy\.com\/(?:.*\/)?([^/]+)\/giphy\.[^/]+$/i);
-    if (m) return prefix + "giphy.com/" + m[1].toLowerCase();
-
-    return key;
+        const urlMatch = key.match(/^v4:(.+)$/);
+        if (!urlMatch) return true;
+        try {
+            return !decodeURIComponent(urlMatch[1]).split("\n")
+                .some(url => globalNames.has(getFileName(url).toLowerCase()));
+        } catch {
+            return true;
+        }
+    }));
 }
 
 function loadBlockedMedia() {
     const raw = settings.store.blockedUrls.split(",").map((s: string) => s.trim()).filter(Boolean);
-    const migrated = raw.map(fixOldKey);
-    blockedUrlCache = new Set(migrated);
+    const invalidTenorKeys = new Set(["v4f:m", "v4f:view", "v4:tenor.com%2Fm", "v4:tenor.com%2Fview"]);
+    blockedUrlCache = removeCoveredBlockKeys(new Set(raw.filter(key => !invalidTenorKeys.has(key.toLowerCase()))));
     const joined = [...blockedUrlCache].join(",");
     if (joined !== settings.store.blockedUrls) settings.store.blockedUrls = joined;
     updateBlockedFiles();
@@ -265,7 +301,17 @@ function saveBlockedMedia(keys: Set<string>) {
 }
 
 function isMediaBlocked(channelId: string, urls: string[]): boolean {
-    return urls.length > 0 && makeBlockKeys(channelId, urls).some(key => blockedUrlCache.has(key));
+    if (urls.length === 0) return false;
+    if (makeBlockKeys(channelId, urls).some(key => blockedUrlCache.has(key))) return true;
+
+    const channelNames = blockedFileNamesByChannel.get(channelId);
+    return urls.some(url => {
+        const canon = cleanUrl(url);
+        const fileName = getFileName(url).toLowerCase();
+        return blockedCanonicalUrls.has(canon)
+            || blockedFileNames.has(fileName)
+            || channelNames?.has(fileName);
+    });
 }
 
 function blockMedia(channelId: string, rawUrls: string[]) {
@@ -278,6 +324,28 @@ function blockMedia(channelId: string, rawUrls: string[]) {
 function unblockMedia(channelId: string, rawUrls: string[]) {
     const next = new Set(blockedUrlCache);
     for (const key of makeBlockKeys(channelId, rawUrls)) next.delete(key);
+    const canonicalUrls = new Set(rawUrls.map(cleanUrl));
+    const fileNames = new Set(rawUrls.map(url => getFileName(url).toLowerCase()));
+    for (const key of next) {
+        const urlMatch = key.match(/^v4:(.+)$/);
+        if (urlMatch) {
+            try {
+                if (decodeURIComponent(urlMatch[1]).split("\n").some(url => canonicalUrls.has(url))) next.delete(key);
+            } catch {}
+            continue;
+        }
+
+        const fileMatch = key.match(/^v4f:(.+)$/);
+        if (fileMatch) {
+            try { if (fileNames.has(decodeURIComponent(fileMatch[1]).toLowerCase())) next.delete(key); } catch {}
+            continue;
+        }
+
+        const imageMatch = key.match(/^v4i:([^:]+):(.+)$/);
+        if (imageMatch?.[1] === channelId) {
+            try { if (fileNames.has(decodeURIComponent(imageMatch[2]).toLowerCase())) next.delete(key); } catch {}
+        }
+    }
     saveBlockedMedia(next);
     scanHiddenMessages();
 }
