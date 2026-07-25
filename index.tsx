@@ -3,7 +3,7 @@ import { definePluginSettings } from "@api/Settings";
 import { Button } from "@components/Button";
 import { Devs } from "@utils/constants";
 import definePlugin, { OptionType } from "@utils/types";
-import { FluxDispatcher, Forms, Menu, MessageStore, React, UserStore } from "@webpack/common";
+import { FluxDispatcher, Forms, Menu, MessageStore, React } from "@webpack/common";
 
 const HIDDEN_ATTR = "data-vc-hidden";
 const MOSAIC_ATTR = "data-vc-hidden-mosaic";
@@ -11,6 +11,8 @@ const MOSAIC_MEDIA_ATTR = "data-vc-mosaic-media-hidden";
 const MOSAIC_PLACEHOLDER_ATTR = "data-vc-mosaic-placeholder";
 const MOSAIC_POSITION_ATTR = "data-vc-mosaic-position";
 const MOSAIC_VISIBILITY_ATTR = "data-vc-mosaic-visibility";
+const MOSAIC_URL_ATTR = "data-vc-mosaic-url";
+const MOSAIC_MESSAGE_ATTR = "data-vc-mosaic-message";
 const PLACEHOLDER_CLASS = "vc-hide-user-gifs-placeholder";
 const STYLE_ID = "vc-hide-user-gifs-style";
 
@@ -29,6 +31,12 @@ const settings = definePluginSettings({
         description: "Media hidden by this plugin.",
         default: ""
     },
+    urlHashMap: {
+        type: OptionType.STRING,
+        description: "Cached image identities.",
+        default: "",
+        hidden: true
+    },
     dragToPeek: {
         type: OptionType.BOOLEAN,
         description: "Drag down on a placeholder to peek at the media.",
@@ -38,12 +46,6 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Play GIFs automatically while peeking.",
         default: true
-    },
-    doNotHideMyImages: {
-        type: OptionType.BOOLEAN,
-        description: "Keep images you send visible. This does not apply to GIFs or videos.",
-        default: true,
-        onChange: () => { scanHiddenMessages(); scanMessages(); }
     },
     placeholderUrl: {
         type: OptionType.STRING,
@@ -213,21 +215,12 @@ function isImageUrl(url: string): boolean {
     return IMAGE_EXT_RE.test(cleanUrl(url));
 }
 
-function skipOwnImage(url: string, isOwn: boolean): boolean {
-    return isOwn && settings.store.doNotHideMyImages && isImageUrl(url);
-}
-
-
 function makeSignatureKey(urls: string[]): string {
     const signature = [...new Set(urls.map(cleanUrl))].sort().join("\n");
     return `v4:${encodeURIComponent(signature)}`;
 }
 
-function makeBlockKeys(channelId: string, urls: string[]): string[] {
-    const isAnimated = urls.some(url => isGifUrl(url) || VIDEO_EXT_RE.test(cleanUrl(url)));
-    if (!isAnimated && urls.every(isImageUrl)) {
-        return [...new Set(urls.map(url => `v4i:${channelId}:${encodeURIComponent(getFileName(url))}`))];
-    }
+function makeBlockKeys(urls: string[]): string[] {
     return [makeSignatureKey(urls)];
 }
 
@@ -235,32 +228,42 @@ function makeBlockKeys(channelId: string, urls: string[]): string[] {
 let blockedUrlCache = new Set<string>();
 let blockedCanonicalUrls = new Set<string>();
 let blockedFileNames = new Set<string>();
-let blockedFileNamesByChannel = new Map<string, Set<string>>();
+// hashes catch the same image even when Discord changes its URL
+let blockedHashes = new Set<string>();
+let blockedHashFilters: Array<{ hash: string; size: number; width: number; height: number; }> = [];
+const mediaHashes = new Map<string, string>();
+const hashRequests = new Map<string, Promise<string | null>>();
+const MEDIA_HASH_CACHE_MAX = 1500;
+let hashSaveTimer: number | null = null;
 let activeBlockCount = 0;
 
 function updateBlockedFiles() {
     blockedCanonicalUrls.clear();
     blockedFileNames.clear();
-    blockedFileNamesByChannel.clear();
+    blockedHashes.clear();
+    blockedHashFilters = [];
     activeBlockCount = 0;
     for (const key of blockedUrlCache) {
+        const hashMatch = key.match(/^v4h:(?:(\d+):(\d+)x(\d+):)?([a-f0-9]{64})$/i);
+        if (hashMatch) {
+            activeBlockCount++;
+            const hash = hashMatch[4].toLowerCase();
+            blockedHashes.add(hash);
+            blockedHashFilters.push({
+                hash,
+                size: Number(hashMatch[1] ?? 0),
+                width: Number(hashMatch[2] ?? 0),
+                height: Number(hashMatch[3] ?? 0)
+            });
+            continue;
+        }
+
         const match = key.match(/^v4:(.+)$/);
         if (match) {
             activeBlockCount++;
             try {
                 for (const url of decodeURIComponent(match[1]).split("\n"))
                     if (url) blockedCanonicalUrls.add(url);
-            } catch {}
-            continue;
-        }
-
-        const imageMatch = key.match(/^v4i:([^:]+):(.+)$/);
-        if (imageMatch) {
-            activeBlockCount++;
-            try {
-                const names = blockedFileNamesByChannel.get(imageMatch[1]) ?? new Set<string>();
-                names.add(decodeURIComponent(imageMatch[2]).toLowerCase());
-                blockedFileNamesByChannel.set(imageMatch[1], names);
             } catch {}
             continue;
         }
@@ -282,11 +285,6 @@ function removeCoveredBlockKeys(keys: Set<string>): Set<string> {
     }
 
     return new Set([...keys].filter(key => {
-        const imageMatch = key.match(/^v4i:[^:]+:(.+)$/);
-        if (imageMatch) {
-            try { return !globalNames.has(decodeURIComponent(imageMatch[1]).toLowerCase()); } catch { return true; }
-        }
-
         const urlMatch = key.match(/^v4:(.+)$/);
         if (!urlMatch) return true;
         try {
@@ -301,7 +299,10 @@ function removeCoveredBlockKeys(keys: Set<string>): Set<string> {
 function loadBlockedMedia() {
     const raw = settings.store.blockedUrls.split(",").map((s: string) => s.trim()).filter(Boolean);
     const invalidTenorKeys = new Set(["v4f:m", "v4f:view", "v4:tenor.com%2Fm", "v4:tenor.com%2Fview"]);
-    blockedUrlCache = removeCoveredBlockKeys(new Set(raw.filter(key => !invalidTenorKeys.has(key.toLowerCase()))));
+    // channel image keys became obsolete when images moved to content hashes
+    blockedUrlCache = removeCoveredBlockKeys(new Set(raw.filter(key =>
+        !invalidTenorKeys.has(key.toLowerCase()) && !key.startsWith("v4i:")
+    )));
     const joined = [...blockedUrlCache].join(",");
     if (joined !== settings.store.blockedUrls) settings.store.blockedUrls = joined;
     updateBlockedFiles();
@@ -313,23 +314,116 @@ function saveBlockedMedia(keys: Set<string>) {
     updateBlockedFiles();
 }
 
-function isMediaBlocked(channelId: string, urls: string[]): boolean {
-    if (urls.length === 0) return false;
-    if (makeBlockKeys(channelId, urls).some(key => blockedUrlCache.has(key))) return true;
-
-    const channelNames = blockedFileNamesByChannel.get(channelId);
-    return urls.some(url => {
-        const canon = cleanUrl(url);
-        const fileName = getFileName(url).toLowerCase();
-        return blockedCanonicalUrls.has(canon)
-            || blockedFileNames.has(fileName)
-            || channelNames?.has(fileName);
-    });
+function loadMediaHashes() {
+    mediaHashes.clear();
+    for (const line of settings.store.urlHashMap.split("\n")) {
+        const split = line.lastIndexOf("|");
+        if (split < 1) continue;
+        const url = line.slice(0, split);
+        const hash = line.slice(split + 1).toLowerCase();
+        if (/^[a-f0-9]{64}$/.test(hash)) mediaHashes.set(url, hash);
+    }
 }
 
-function blockMedia(channelId: string, rawUrls: string[]) {
+function saveMediaHashes() {
+    while (mediaHashes.size > MEDIA_HASH_CACHE_MAX) dropOldest(mediaHashes);
+    settings.store.urlHashMap = [...mediaHashes]
+        .map(([url, hash]) => `${url}|${hash}`)
+        .join("\n");
+    hashSaveTimer = null;
+}
+
+function rememberMediaHash(urls: string[], hash: string) {
+    let changed = false;
+    for (const url of urls) {
+        const canonicalUrl = cleanUrl(url);
+        if (mediaHashes.get(canonicalUrl) === hash) continue;
+        mediaHashes.set(canonicalUrl, hash);
+        changed = true;
+    }
+    if (changed && hashSaveTimer === null)
+        hashSaveTimer = window.setTimeout(saveMediaHashes, 250);
+}
+
+async function getMediaHash(url: string): Promise<string | null> {
+    const canonicalUrl = cleanUrl(url);
+    const cached = mediaHashes.get(canonicalUrl);
+    if (cached) return cached;
+
+    const pending = hashRequests.get(canonicalUrl);
+    if (pending) return pending;
+
+    const request = fetch(url)
+        .then(response => {
+            if (!response.ok) throw new Error(String(response.status));
+            return response.arrayBuffer();
+        })
+        .then(buffer => crypto.subtle.digest("SHA-256", buffer))
+        .then(digest => [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, "0")).join(""))
+        .catch(() => null)
+        .finally(() => hashRequests.delete(canonicalUrl));
+    hashRequests.set(canonicalUrl, request);
+    return request;
+}
+
+async function getAttachmentHash(urls: string[]): Promise<string | null> {
+    const cached = urls.map(cleanUrl).map(url => mediaHashes.get(url)).find(Boolean);
+    if (cached) {
+        rememberMediaHash(urls, cached);
+        return cached;
+    }
+
+    for (const url of urls) {
+        const hash = await getMediaHash(url);
+        if (!hash) continue;
+        rememberMediaHash(urls, hash);
+        return hash;
+    }
+    return null;
+}
+
+function makeHashBlockKey(hash: string, attachment?: any): string {
+    const size = Number(attachment?.size) || 0;
+    const width = Number(attachment?.width) || 0;
+    const height = Number(attachment?.height) || 0;
+    return size && width && height
+        ? `v4h:${size}:${width}x${height}:${hash}`
+        : `v4h:${hash}`;
+}
+
+function getHashFromBlockKey(key: string): string | undefined {
+    return key.match(/^v4h:(?:\d+:\d+x\d+:)?([a-f0-9]{64})$/i)?.[1]?.toLowerCase();
+}
+
+// this keeps us from downloading every image just to compare hashes
+function couldMatchBlockedHash(attachment: any): boolean {
+    const size = Number(attachment?.size) || 0;
+    const width = Number(attachment?.width) || 0;
+    const height = Number(attachment?.height) || 0;
+    return blockedHashFilters.some(filter =>
+        (!filter.size || !size || filter.size === size)
+        && (!filter.width || !width || filter.width === width)
+        && (!filter.height || !height || filter.height === height)
+    );
+}
+
+function isMediaBlocked(urls: string[]): boolean {
+    if (urls.length === 0) return false;
+    if (urls.some(url => {
+        const canon = cleanUrl(url);
+        const fileName = getFileName(url).toLowerCase();
+        const hash = mediaHashes.get(canon);
+        return blockedCanonicalUrls.has(canon)
+            || blockedFileNames.has(fileName)
+            || !!hash && blockedHashes.has(hash);
+    })) return true;
+
+    return makeBlockKeys(urls).some(key => blockedUrlCache.has(key));
+}
+
+function blockMedia(rawUrls: string[]) {
     const next = new Set(blockedUrlCache);
-    for (const key of makeBlockKeys(channelId, rawUrls)) next.add(key);
+    for (const key of makeBlockKeys(rawUrls)) next.add(key);
     saveBlockedMedia(next);
     scanMessages();
 }
@@ -341,23 +435,80 @@ function blockExactMedia(rawUrl: string) {
     scanMessages();
 }
 
-function unblockExactMedia(rawUrl: string) {
-    const canonicalUrl = cleanUrl(rawUrl);
+async function blockImageByContent(rawUrl: string, relatedUrls: string[], attachment?: any) {
+    const urls = [...new Set([rawUrl, ...relatedUrls])];
+    const hash = await getAttachmentHash(urls);
+    if (!hash) {
+        blockExactMedia(rawUrl);
+        return;
+    }
+
+    const next = new Set(blockedUrlCache);
+    next.add(makeHashBlockKey(hash, attachment));
+    saveBlockedMedia(next);
+    scanMessages();
+}
+
+async function unblockImageByContent(rawUrl: string, relatedUrls: string[]) {
+    const urls = [...new Set([rawUrl, ...relatedUrls])];
+    const hash = await getAttachmentHash(urls);
+    unblockMedia(urls);
+    if (!hash) return;
+
+    const next = new Set(blockedUrlCache);
+    for (const key of next)
+        if (getHashFromBlockKey(key) === hash) next.delete(key);
+    saveBlockedMedia(next);
+    scanHiddenMessages();
+}
+
+async function blockAttachmentGroup(attachments: any[]) {
+    const blocks = await Promise.all(attachments.map(async attachment => {
+        const urls = getAttachmentUrls(attachment);
+        if (urls.length === 0) return undefined;
+        const primaryUrl = attachment.url ?? attachment.proxy_url;
+        if (!primaryUrl) return undefined;
+
+        const isImage = attachment.content_type?.startsWith("image/") || urls.some(isImageUrl);
+        const hash = isImage ? await getAttachmentHash(urls) : null;
+        return hash ? makeHashBlockKey(hash, attachment) : makeSignatureKey([primaryUrl]);
+    }));
+
+    const next = new Set(blockedUrlCache);
+    for (const key of blocks) if (key) next.add(key);
+    saveBlockedMedia(next);
+    scanMessages();
+}
+
+async function unblockAttachmentGroup(attachments: any[]) {
+    const groups = attachments
+        .map(attachment => ({
+            attachment,
+            urls: getAttachmentUrls(attachment)
+        }))
+        .filter(group => group.urls.length > 0);
+    const allUrls = groups.flatMap(group => group.urls);
+    unblockMedia(allUrls);
+
+    const hashes = await Promise.all(groups.map(group => {
+        const isImage = group.attachment.content_type?.startsWith("image/") || group.urls.some(isImageUrl);
+        return isImage ? getAttachmentHash(group.urls) : null;
+    }));
+    const blockedGroupHashes = new Set(hashes.filter((hash): hash is string => !!hash));
+    if (blockedGroupHashes.size === 0) return;
+
     const next = new Set(blockedUrlCache);
     for (const key of next) {
-        const match = key.match(/^v4:(.+)$/);
-        if (!match) continue;
-        try {
-            if (decodeURIComponent(match[1]).split("\n").includes(canonicalUrl)) next.delete(key);
-        } catch {}
+        const hash = getHashFromBlockKey(key);
+        if (hash && blockedGroupHashes.has(hash)) next.delete(key);
     }
     saveBlockedMedia(next);
     scanHiddenMessages();
 }
 
-function unblockMedia(channelId: string, rawUrls: string[]) {
+function unblockMedia(rawUrls: string[]) {
     const next = new Set(blockedUrlCache);
-    for (const key of makeBlockKeys(channelId, rawUrls)) next.delete(key);
+    for (const key of makeBlockKeys(rawUrls)) next.delete(key);
     const canonicalUrls = new Set(rawUrls.map(cleanUrl));
     const fileNames = new Set(rawUrls.map(url => getFileName(url).toLowerCase()));
     for (const key of next) {
@@ -375,10 +526,6 @@ function unblockMedia(channelId: string, rawUrls: string[]) {
             continue;
         }
 
-        const imageMatch = key.match(/^v4i:([^:]+):(.+)$/);
-        if (imageMatch?.[1] === channelId) {
-            try { if (fileNames.has(decodeURIComponent(imageMatch[2]).toLowerCase())) next.delete(key); } catch {}
-        }
     }
     saveBlockedMedia(next);
     scanHiddenMessages();
@@ -413,13 +560,26 @@ function getAttachmentUrls(attachment: any): string[] {
     return [attachment?.url, attachment?.proxy_url].filter((url): url is string => !!url);
 }
 
+// only hash attachments that could match something already blocked
+function queueMessageHashes(message: any, messageEl: HTMLElement) {
+    if (blockedHashes.size === 0) return;
+
+    for (const attachment of message?.attachments ?? []) {
+        const urls = getAttachmentUrls(attachment);
+        if (urls.length === 0) continue;
+        if (!attachment.content_type?.startsWith("image/") && !urls.some(isImageUrl)) continue;
+        if (urls.some(url => mediaHashes.has(cleanUrl(url)))) continue;
+        if (!couldMatchBlockedHash(attachment)) continue;
+
+        void getAttachmentHash(urls).then(hash => {
+            if (hash && blockedHashes.has(hash) && messageEl.isConnected)
+                checkMessageSoon(messageEl);
+        });
+    }
+}
+
 function hasBlockedMedia(message: any): boolean {
-    const channelId = message?.channel_id ?? message?.channelId;
-    const authorId = message?.author?.id;
-    if (!channelId || !authorId) return false;
-    const isOwn = authorId === UserStore.getCurrentUser()?.id;
-    const urls = getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn));
-    return isMediaBlocked(channelId, urls);
+    return isMediaBlocked(getMediaUrls(message));
 }
 
 const CHANNEL_CACHE_MAX = 300;
@@ -502,11 +662,6 @@ function getMediaTitle(src: string): string {
 }
 
 function getPlaceholderTitle(message: any): string | undefined {
-    const channelId = message?.channel_id ?? message?.channelId;
-    const authorId = message?.author?.id;
-    if (!channelId || !authorId) return undefined;
-    const isOwn = authorId === UserStore.getCurrentUser()?.id;
-
     const candidates: string[] = [];
     for (const att of message?.attachments ?? []) {
         const u = att.url || att.proxy_url;
@@ -517,9 +672,8 @@ function getPlaceholderTitle(message: any): string | undefined {
         if (u) candidates.push(u);
     }
 
-    const visibleCandidates = candidates.filter(u => !skipOwnImage(u, isOwn));
-    return isMediaBlocked(channelId, getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn)))
-        ? visibleCandidates[0] && getMediaTitle(visibleCandidates[0])
+    return isMediaBlocked(getMediaUrls(message))
+        ? candidates[0] && getMediaTitle(candidates[0])
         : undefined;
 }
 
@@ -531,10 +685,6 @@ interface PlaceholderDims { w: number; h: number; }
 
 // finds the file that goes behind the cover
 function getRevealMedia(message: any): RevealSource | undefined {
-    const channelId = message?.channel_id ?? message?.channelId;
-    const authorId = message?.author?.id;
-    if (!channelId || !authorId) return undefined;
-
     const img: ImgCandidate[] = [];
     const gifVid: ImgCandidate[] = [];
     const vidFile: ImgCandidate[] = [];
@@ -587,8 +737,7 @@ function getRevealMedia(message: any): RevealSource | undefined {
         else addImg(url);
     }
 
-    const isOwn = authorId === UserStore.getCurrentUser()?.id;
-    const messageBlocked = isMediaBlocked(channelId, getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn)));
+    const messageBlocked = isMediaBlocked(getMediaUrls(message));
     const blocked = (_u: string) => messageBlocked;
     const pick = (c: ImgCandidate, kind: RevealSource["kind"]): RevealSource => ({ src: c.u, kind, nw: c.w, nh: c.h, poster: c.poster });
 
@@ -673,16 +822,18 @@ function measureMedia(container: HTMLElement, nat?: { w: number; h: number }): P
 
 // reuse a good size so the message doesn't jump around
 function getPlaceholderSize(measured: PlaceholderDims | undefined, reveal?: RevealSource): PlaceholderDims | undefined {
-    const key    = reveal ? cleanUrl(reveal.src) : undefined;
+    const canonicalUrl = reveal ? cleanUrl(reveal.src) : undefined;
+    const key = canonicalUrl;
     const nat    = reveal?.nw && reveal?.nh ? { w: reveal.nw, h: reveal.nh } : undefined;
+    if (measured && isGoodSize(measured, nat)) {
+        if (key) saveSize(key, measured);
+        return measured;
+    }
+
     const cached = key ? measuredDimsCache.get(key) : undefined;
     if (cached) {
         if (isGoodSize(cached, nat)) return cached;
         measuredDimsCache.delete(key!);
-    }
-    if (measured && isGoodSize(measured, nat)) {
-        if (key) saveSize(key, measured);
-        return measured;
     }
     return nat ? fitSize(nat.w, nat.h) : undefined;
 }
@@ -708,7 +859,7 @@ function addCurtain(cover: HTMLElement, reveal: RevealSource, dims?: Placeholder
         cover.style.display = "flex";
         cover.style.alignItems = "center";
         cover.style.justifyContent = "center";
-        cover.style.background = "var(--background-secondary)";
+        cover.style.background = "var(--background-primary, #1e1f22)";
     }
     cover.style.zIndex = "0";
 
@@ -861,18 +1012,24 @@ async function loadPlaceholderImage(rescan = true) {
     if (rescan) refreshPlaceholders();
 }
 
-function getMosaicItems(messageEl: HTMLElement): Array<{ cell: HTMLElement; media: HTMLElement; }> {
-    const cellSelector = "[class*='mosaicItem'],[class*='visualMediaItemContainer'],[class*='imageWrapper']";
+function getMosaicItems(messageEl: HTMLElement, attachmentCount: number): Array<{ cell: HTMLElement; media: HTMLElement; }> {
+    const groupSelector = "[class*='mediaAttachmentsContainer'],[class*='oneByOneGrid']";
+    const group = [...messageEl.querySelectorAll<HTMLElement>(groupSelector)]
+        .find(el => el.querySelectorAll("img,video").length >= attachmentCount);
+    const root = group ?? messageEl;
+    const cellSelector = group
+        ? "[class*='mosaicItem'],[class*='visualMediaItemContainer'],[class*='imageWrapper']"
+        : "[class*='mosaicItem'],[class*='visualMediaItemContainer']";
     const items = new Map<HTMLElement, HTMLElement>();
 
-    for (const media of messageEl.querySelectorAll<HTMLElement>("img,video")) {
+    for (const media of root.querySelectorAll<HTMLElement>("img,video")) {
         if (media.closest(`.${PLACEHOLDER_CLASS}`)) continue;
         const cell = media.closest<HTMLElement>(cellSelector);
-        if (!cell || !messageEl.contains(cell) || items.has(cell)) continue;
+        if (!cell || !root.contains(cell) || items.has(cell)) continue;
         items.set(cell, media);
     }
 
-    return [...items].map(([cell, media]) => ({ cell, media }));
+    return [...items].slice(0, attachmentCount).map(([cell, media]) => ({ cell, media }));
 }
 
 function restoreMosaicItem(cell: HTMLElement, media: HTMLElement) {
@@ -888,9 +1045,10 @@ function restoreMosaicItem(cell: HTMLElement, media: HTMLElement) {
         cell.style.position = cell.getAttribute(MOSAIC_POSITION_ATTR) || "";
         cell.removeAttribute(MOSAIC_POSITION_ATTR);
     }
+
 }
 
-function getMosaicItemUrls(message: any, media: HTMLElement, index: number): string[] {
+function getMosaicItem(message: any, media: HTMLElement, index: number): { attachment: any; urls: string[]; } {
     const src = (media as HTMLImageElement).currentSrc
         || (media as HTMLImageElement).src
         || media.getAttribute("src")
@@ -901,25 +1059,27 @@ function getMosaicItemUrls(message: any, media: HTMLElement, index: number): str
         getAttachmentUrls(att).some(url => cleanUrl(url) === canonicalSrc)
     ) ?? attachments[index];
 
-    return [...new Set([src, ...getAttachmentUrls(attachment)].filter(Boolean))];
+    return {
+        attachment,
+        urls: [...new Set([src, ...getAttachmentUrls(attachment)].filter(Boolean))]
+    };
 }
 
+// mosaics need a separate placeholder for each attachment
 function hideMosaicMedia(messageEl: HTMLElement, message: any): boolean {
     if ((message?.attachments?.length ?? 0) < 2) return false;
 
-    const items = getMosaicItems(messageEl)
+    const items = getMosaicItems(messageEl, message.attachments.length)
         .map(item => ({ ...item, rect: item.cell.getBoundingClientRect() }))
         .filter(item => item.rect.width >= 1 && item.rect.height >= 1);
     if (items.length < 2) return false;
 
-    const channelId = message.channel_id ?? message.channelId;
-    const isOwn = message.author?.id === UserStore.getCurrentUser()?.id;
     let hiddenCount = 0;
 
     for (const [index, { cell, media, rect }] of items.entries()) {
-        const urls = getMosaicItemUrls(message, media, index)
-            .filter(url => !skipOwnImage(url, isOwn));
-        if (!channelId || !isMediaBlocked(channelId, urls)) {
+        const item = getMosaicItem(message, media, index);
+        const urls = item.urls;
+        if (!isMediaBlocked(urls)) {
             restoreMosaicItem(cell, media);
             continue;
         }
@@ -951,6 +1111,9 @@ function hideMosaicMedia(messageEl: HTMLElement, message: any): boolean {
             h: Math.round(rect.height)
         });
         placeholder.setAttribute(MOSAIC_PLACEHOLDER_ATTR, "");
+        const originalUrl = item.attachment?.url ?? item.attachment?.proxy_url;
+        if (originalUrl) placeholder.setAttribute(MOSAIC_URL_ATTR, originalUrl);
+        if (message.id) placeholder.setAttribute(MOSAIC_MESSAGE_ATTR, message.id);
         placeholder.style.position = "absolute";
         placeholder.style.inset = "0";
         placeholder.style.width = "100%";
@@ -1090,6 +1253,7 @@ function checkMessage(messageEl: HTMLElement, allowUnhide = false): boolean {
         log("unresolved", messageEl.dataset.listItemId);
         return false;
     }
+    queueMessageHashes(message, messageEl);
     if (hasBlockedMedia(message)) {
         if (!hideMessageMedia(messageEl, message)) return false;
         log("HIDE", message.id);
@@ -1100,8 +1264,8 @@ function checkMessage(messageEl: HTMLElement, allowUnhide = false): boolean {
                 const authorId = message.author?.id ?? "";
                 log("NOT blocked", message.id, "author", authorId, urls.map(u => ({
                     url: u,
-                    keys: makeBlockKeys(message.channel_id ?? message.channelId ?? "", urls),
-                    inCache: makeBlockKeys(message.channel_id ?? message.channelId ?? "", urls).some(key => blockedUrlCache.has(key))
+                    keys: makeBlockKeys(urls),
+                    inCache: makeBlockKeys(urls).some(key => blockedUrlCache.has(key))
                 })));
             }
         }
@@ -1113,11 +1277,25 @@ function checkMessage(messageEl: HTMLElement, allowUnhide = false): boolean {
     return true;
 }
 
-// message data can show up a few frames after the element
+// message data can show up late, so keep one retry loop per row
+const pendingMessageChecks = new WeakSet<HTMLElement>();
+
 function checkMessageSoon(messageEl: HTMLElement, attempt = 0) {
-    if (!messageEl.isConnected) return;
-    if (checkMessage(messageEl)) return;
-    if (attempt < 120) requestAnimationFrame(() => checkMessageSoon(messageEl, attempt + 1));
+    if (attempt === 0) {
+        if (pendingMessageChecks.has(messageEl)) return;
+        pendingMessageChecks.add(messageEl);
+    }
+
+    if (!messageEl.isConnected || checkMessage(messageEl)) {
+        pendingMessageChecks.delete(messageEl);
+        return;
+    }
+
+    if (attempt < 120) {
+        requestAnimationFrame(() => checkMessageSoon(messageEl, attempt + 1));
+    } else {
+        pendingMessageChecks.delete(messageEl);
+    }
 }
 
 function scanMessages() {
@@ -1196,11 +1374,7 @@ function checkMessageUpdate({ message }: any) {
     if (!message?.id || !message?.channel_id) return;
     if (activeBlockCount === 0) return;
 
-    const authorId = message?.author?.id;
-    if (!authorId) return;
-
-    const isOwn = authorId === UserStore.getCurrentUser()?.id;
-    const hasBlocked = isMediaBlocked(message.channel_id, getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn)));
+    const hasBlocked = isMediaBlocked(getMediaUrls(message));
     if (!hasBlocked) return;
 
     const els = document.querySelectorAll<HTMLElement>(
@@ -1209,15 +1383,7 @@ function checkMessageUpdate({ message }: any) {
     );
     if (els.length === 0) return;
 
-    for (const el of els) {
-        let attempts = 0;
-        const ensurePlaceholder = () => {
-            if (!el.isConnected) return;
-            if (hideMessageMedia(el, message)) return;
-            if (++attempts < 120) requestAnimationFrame(ensurePlaceholder);
-        };
-        ensurePlaceholder();
-    }
+    for (const el of els) checkMessageSoon(el);
 }
 
 let xhrOpenOrig: typeof XMLHttpRequest.prototype.open | null = null;
@@ -1257,16 +1423,30 @@ function stopWatchingSearch() {
 }
 
 // right click menu
-function getContextAttachment(message: any, props: any): { url: string; urls: string[]; } | undefined {
+let mosaicContextTarget: { messageId: string; url: string; } | null = null;
+
+function captureMosaicContext(event: MouseEvent) {
+    mosaicContextTarget = null;
+    if (!(event.target instanceof Element)) return;
+    const placeholder = event.target.closest<HTMLElement>(`[${MOSAIC_URL_ATTR}]`);
+    const messageId = placeholder?.getAttribute(MOSAIC_MESSAGE_ATTR);
+    const url = placeholder?.getAttribute(MOSAIC_URL_ATTR);
+    if (messageId && url) mosaicContextTarget = { messageId, url };
+}
+
+function getContextAttachment(message: any, props: any): { attachment: any; url: string; urls: string[]; } | undefined {
     const clickedUrls = [props?.src, props?.itemHref, props?.itemSrc, props?.itemSafeSrc]
         .filter((url): url is string => !!url);
+    const capturedTarget = mosaicContextTarget;
+    if (capturedTarget && capturedTarget.messageId === message?.id)
+        clickedUrls.unshift(capturedTarget.url);
     if (clickedUrls.length === 0) return undefined;
 
     const clicked = new Set(clickedUrls.map(cleanUrl));
     for (const attachment of message?.attachments ?? []) {
         const urls = getAttachmentUrls(attachment);
         if (urls.some(url => clicked.has(cleanUrl(url)))) {
-            return { url: attachment.url ?? attachment.proxy_url, urls };
+            return { attachment, url: attachment.url ?? attachment.proxy_url, urls };
         }
     }
     return undefined;
@@ -1282,40 +1462,48 @@ function addContextItem(children: any[], item: React.ReactElement) {
 
 const messageContextPatch: NavContextMenuPatchCallback = (children, props) => {
     const message  = props?.message;
-    const authorId = message?.author?.id;
-    if (!authorId) return;
+    if (!message) return;
 
-    const isOwn = authorId === UserStore.getCurrentUser()?.id;
-    const mediaUrls = getMediaUrls(message).filter(url => !skipOwnImage(url, isOwn));
+    const mediaUrls = getMediaUrls(message);
     if (mediaUrls.length === 0) return;
 
-    const channelId = message.channel_id ?? message.channelId;
-    if (!channelId) return;
+    const attachments = [...(message.attachments ?? [])];
+    const target = getContextAttachment(message, props) ?? (attachments.length === 1
+        ? (() => {
+            const urls = getAttachmentUrls(attachments[0]);
+            return urls.length > 0
+                ? { attachment: attachments[0], url: attachments[0].url ?? attachments[0].proxy_url, urls }
+                : undefined;
+        })()
+        : undefined);
+    const targetUrls = target?.urls ?? [];
+    const multipleAttachments = attachments.length > 1;
 
-    const target = getContextAttachment(message, props);
-    const targetUrls = target?.urls.filter(url => !skipOwnImage(url, isOwn)) ?? [];
-    const multipleAttachments = (message.attachments?.length ?? 0) > 1;
-
-    if (target && targetUrls.length > 0 && multipleAttachments) {
-        const targetBlocked = isMediaBlocked(channelId, targetUrls);
+    if (target && targetUrls.length > 0) {
+        const targetBlocked = isMediaBlocked(targetUrls);
+        const targetIsImage = targetUrls.some(isImageUrl);
         addContextItem(children, (
             <Menu.MenuItem
                 id="vc-hide-media-single-toggle"
-                label={targetBlocked ? "Unhide this image" : "Hide this image"}
+                label={targetBlocked
+                    ? `Unhide this ${targetIsImage ? "image" : "media"}`
+                    : `Hide this ${targetIsImage ? "image" : "media"}`}
                 action={() => targetBlocked
-                    ? unblockMedia(channelId, targetUrls)
-                    : blockExactMedia(target.url)}
+                    ? void unblockImageByContent(target.url, targetUrls)
+                    : void blockImageByContent(target.url, targetUrls, target.attachment)}
             />
         ));
+
+        if (!multipleAttachments) return;
     }
 
-    const groups = [...(message.attachments ?? [])]
+    const groups = attachments
         .map(getAttachmentUrls)
-        .map(urls => urls.filter(url => !skipOwnImage(url, isOwn)))
         .filter(urls => urls.length > 0);
+    const allUrls = groups.length > 0 ? groups.flat() : mediaUrls;
     const allBlocked = groups.length > 0
-        ? groups.every(urls => isMediaBlocked(channelId, urls))
-        : isMediaBlocked(channelId, mediaUrls);
+        ? groups.every(urls => isMediaBlocked(urls))
+        : isMediaBlocked(mediaUrls);
     const allLabel = multipleAttachments
         ? (allBlocked ? "Unhide all media" : "Hide all media")
         : (allBlocked ? "Unhide this media" : "Hide this media");
@@ -1325,8 +1513,12 @@ const messageContextPatch: NavContextMenuPatchCallback = (children, props) => {
             id="vc-hide-media-all-toggle"
             label={allLabel}
             action={() => allBlocked
-                ? unblockMedia(channelId, mediaUrls)
-                : blockMedia(channelId, mediaUrls)}
+                ? (groups.length > 0
+                    ? void unblockAttachmentGroup(attachments)
+                    : unblockMedia(allUrls))
+                : (groups.length > 0
+                    ? void blockAttachmentGroup(attachments)
+                    : blockMedia(allUrls))}
         />
     ));
 };
@@ -1339,12 +1531,16 @@ const imageContextPatch: NavContextMenuPatchCallback = (children, props) => {
 
     const src = props?.src;
     if (!src) return;
-    const blocked = blockedCanonicalUrls.has(cleanUrl(src));
+    const canonicalSrc = cleanUrl(src);
+    const hash = mediaHashes.get(canonicalSrc);
+    const blocked = blockedCanonicalUrls.has(canonicalSrc) || !!hash && blockedHashes.has(hash);
     addContextItem(children, (
         <Menu.MenuItem
             id="vc-hide-media-image-toggle"
             label={blocked ? "Unhide this image" : "Hide this image"}
-            action={() => blocked ? unblockExactMedia(src) : blockExactMedia(src)}
+            action={() => blocked
+                ? void unblockImageByContent(src, [src])
+                : void blockImageByContent(src, [src])}
         />
     ));
 };
@@ -1364,6 +1560,8 @@ export default definePlugin({
     start() {
         Vencord.Api.ContextMenu.addContextMenuPatch("message", messageContextPatch);
         Vencord.Api.ContextMenu.addContextMenuPatch("image-context", imageContextPatch);
+        document.addEventListener("contextmenu", captureMosaicContext, true);
+        loadMediaHashes();
         loadBlockedMedia();
         cachedPlaceholderSrc = undefined;
         loadPlaceholderImage(false);
@@ -1374,10 +1572,10 @@ export default definePlugin({
             [${HIDDEN_ATTR}]:not([${MOSAIC_ATTR}]) :is(${MEDIA_SELECTORS}) { display: none !important; }
             .${PLACEHOLDER_CLASS} { display: block; border-radius: 4px; }
             .${PLACEHOLDER_CLASS}:is(img) { width: 200px; height: auto; }
-            .${PLACEHOLDER_CLASS}:is(div) { padding: 6px 10px; font-size: 12px; color: var(--text-muted); background: var(--background-secondary); width: fit-content; }
+            .${PLACEHOLDER_CLASS}:is(div) { padding: 6px 10px; font-size: 12px; color: var(--text-muted); background: var(--background-primary, #1e1f22); width: fit-content; }
 
             /* Drag-to-peek curtain */
-            .${PLACEHOLDER_CLASS}.${CURTAIN_CLASS} { position: relative; width: fit-content; padding: 0; background: none; overflow: hidden; }
+            .${PLACEHOLDER_CLASS}.${CURTAIN_CLASS} { position: relative; width: fit-content; padding: 0; background: var(--background-primary, #1e1f22); overflow: hidden; isolation: isolate; }
             .${CURTAIN_REVEAL_CLASS} { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: fill; z-index: 0; border-radius: 4px; background: var(--background-secondary); }
             .${CURTAIN_COVER_CLASS} { position: relative; z-index: 1; }
             .${CURTAIN_HANDLE_CLASS} { position: absolute; left: 0; right: 0; top: 0; height: 18px; z-index: 2; display: flex; align-items: center; justify-content: center; cursor: row-resize; background: linear-gradient(to bottom, rgba(0,0,0,.55), rgba(0,0,0,0)); border-radius: 4px 4px 0 0; touch-action: none; }
@@ -1403,6 +1601,8 @@ export default definePlugin({
     stop() {
         Vencord.Api.ContextMenu.removeContextMenuPatch("message", messageContextPatch);
         Vencord.Api.ContextMenu.removeContextMenuPatch("image-context", imageContextPatch);
+        document.removeEventListener("contextmenu", captureMosaicContext, true);
+        mosaicContextTarget = null;
         observer?.disconnect();
         observer = null;
         if (startupRescanTimer !== null) window.clearTimeout(startupRescanTimer);
@@ -1413,6 +1613,12 @@ export default definePlugin({
         channelForMessage.clear();
         normCache.clear();
         measuredDimsCache.clear();
+        hashRequests.clear();
+        if (hashSaveTimer !== null) {
+            window.clearTimeout(hashSaveTimer);
+            saveMediaHashes();
+        }
+        mediaHashes.clear();
 
         FluxDispatcher.unsubscribe("MESSAGE_UPDATE",       checkMessageUpdate);
         FluxDispatcher.unsubscribe("MESSAGE_EMBED_UPDATE", checkMessageUpdate);
