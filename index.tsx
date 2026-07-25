@@ -159,6 +159,12 @@ function cleanUrl(url: string): string {
             } else {
                 result = host + "/" + parts.join("/");
             }
+        } else if (host === "youtu.be" && parts[0]) {
+            result = "youtube.com/" + parts[0];
+        } else if (host === "youtube.com" || host.endsWith(".youtube.com") || host === "youtube-nocookie.com" || host.endsWith(".youtube-nocookie.com")) {
+            const videoId = parsed.searchParams.get("v")
+                ?? (["embed", "live", "shorts"].includes(parts[0]) ? parts[1] : undefined);
+            result = videoId ? "youtube.com/" + videoId : host + "/" + parts.join("/");
         } else if (host.includes("tenor.com") && parts.length > 0) {
             let tenorId: string;
             if (host === "media.tenor.com") {
@@ -299,10 +305,23 @@ function removeCoveredBlockKeys(keys: Set<string>): Set<string> {
 function loadBlockedMedia() {
     const raw = settings.store.blockedUrls.split(",").map((s: string) => s.trim()).filter(Boolean);
     const invalidTenorKeys = new Set(["v4f:m", "v4f:view", "v4:tenor.com%2Fm", "v4:tenor.com%2Fview"]);
+    const cleanSavedKey = (key: string): string | null => {
+        const match = key.match(/^v4:(.+)$/);
+        if (!match) return key;
+        try {
+            const urls = decodeURIComponent(match[1]).split("\n").filter(url =>
+                !/^(?:www\.|m\.|music\.)?youtube\.com\/watch$/i.test(url)
+            );
+            return urls.length > 0 ? `v4:${encodeURIComponent(urls.join("\n"))}` : null;
+        } catch {
+            return key;
+        }
+    };
     // channel image keys became obsolete when images moved to content hashes
-    blockedUrlCache = removeCoveredBlockKeys(new Set(raw.filter(key =>
-        !invalidTenorKeys.has(key.toLowerCase()) && !key.startsWith("v4i:")
-    )));
+    blockedUrlCache = removeCoveredBlockKeys(new Set(raw
+        .filter(key => !invalidTenorKeys.has(key.toLowerCase()) && !key.startsWith("v4i:"))
+        .map(cleanSavedKey)
+        .filter((key): key is string => !!key)));
     const joined = [...blockedUrlCache].join(",");
     if (joined !== settings.store.blockedUrls) settings.store.blockedUrls = joined;
     updateBlockedFiles();
