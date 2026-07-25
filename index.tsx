@@ -6,6 +6,11 @@ import definePlugin, { OptionType } from "@utils/types";
 import { FluxDispatcher, Forms, Menu, MessageStore, React, UserStore } from "@webpack/common";
 
 const HIDDEN_ATTR = "data-vc-hidden";
+const MOSAIC_ATTR = "data-vc-hidden-mosaic";
+const MOSAIC_MEDIA_ATTR = "data-vc-mosaic-media-hidden";
+const MOSAIC_PLACEHOLDER_ATTR = "data-vc-mosaic-placeholder";
+const MOSAIC_POSITION_ATTR = "data-vc-mosaic-position";
+const MOSAIC_VISIBILITY_ATTR = "data-vc-mosaic-visibility";
 const PLACEHOLDER_CLASS = "vc-hide-user-gifs-placeholder";
 const STYLE_ID = "vc-hide-user-gifs-style";
 
@@ -196,6 +201,14 @@ function isGifUrl(url: string): boolean {
     return GIF_HOST_RE.test(canon) || GIF_EXT_RE.test(canon) || canon.endsWith("giphy.mp4");
 }
 
+function isDirectVideoUrl(url: string): boolean {
+    try {
+        return VIDEO_EXT_RE.test(new URL(url).pathname);
+    } catch {
+        return VIDEO_EXT_RE.test(url.split("?")[0]);
+    }
+}
+
 function isImageUrl(url: string): boolean {
     return IMAGE_EXT_RE.test(cleanUrl(url));
 }
@@ -321,6 +334,27 @@ function blockMedia(channelId: string, rawUrls: string[]) {
     scanMessages();
 }
 
+function blockExactMedia(rawUrl: string) {
+    const next = new Set(blockedUrlCache);
+    next.add(makeSignatureKey([rawUrl]));
+    saveBlockedMedia(next);
+    scanMessages();
+}
+
+function unblockExactMedia(rawUrl: string) {
+    const canonicalUrl = cleanUrl(rawUrl);
+    const next = new Set(blockedUrlCache);
+    for (const key of next) {
+        const match = key.match(/^v4:(.+)$/);
+        if (!match) continue;
+        try {
+            if (decodeURIComponent(match[1]).split("\n").includes(canonicalUrl)) next.delete(key);
+        } catch {}
+    }
+    saveBlockedMedia(next);
+    scanHiddenMessages();
+}
+
 function unblockMedia(channelId: string, rawUrls: string[]) {
     const next = new Set(blockedUrlCache);
     for (const key of makeBlockKeys(channelId, rawUrls)) next.delete(key);
@@ -362,8 +396,7 @@ function saveSearchMessage(id: string, msg: any) {
 function getMediaUrls(message: any): string[] {
     const urls: string[] = [];
     for (const att of message?.attachments ?? []) {
-        if (att.url)       urls.push(att.url);
-        if (att.proxy_url) urls.push(att.proxy_url);
+        urls.push(...getAttachmentUrls(att));
     }
     for (const embed of message?.embeds ?? []) {
         if (embed.url)                urls.push(embed.url);
@@ -374,6 +407,10 @@ function getMediaUrls(message: any): string[] {
         if (embed.thumbnail?.proxy_url) urls.push(embed.thumbnail.proxy_url);
     }
     return urls;
+}
+
+function getAttachmentUrls(attachment: any): string[] {
+    return [attachment?.url, attachment?.proxy_url].filter((url): url is string => !!url);
 }
 
 function hasBlockedMedia(message: any): boolean {
@@ -530,10 +567,24 @@ function getRevealMedia(message: any): RevealSource | undefined {
                 if (vid.url)       vidFile.push({ u: vid.url, w: vid.width, h: vid.height, poster });
             }
         }
+        if (embed.url) {
+            const w = embed.image?.width ?? embed.thumbnail?.width;
+            const h = embed.image?.height ?? embed.thumbnail?.height;
+            const poster = embed.thumbnail?.proxy_url || embed.thumbnail?.url || embed.image?.proxy_url || embed.image?.url;
+            if (isDirectVideoUrl(embed.url)) vidFile.push({ u: embed.url, w, h, poster });
+            else if (isGifUrl(embed.url)) gifVid.push({ u: embed.url, w, h, poster });
+        }
         addImg(embed.image?.proxy_url,     embed.image?.width,     embed.image?.height);
         addImg(embed.image?.url,           embed.image?.width,     embed.image?.height);
         addImg(embed.thumbnail?.proxy_url, embed.thumbnail?.width, embed.thumbnail?.height);
         addImg(embed.thumbnail?.url,       embed.thumbnail?.width, embed.thumbnail?.height);
+    }
+
+    for (const match of message?.content?.matchAll(/https?:\/\/[^\s<>]+/g) ?? []) {
+        const url = match[0];
+        if (isDirectVideoUrl(url)) vidFile.push({ u: url });
+        else if (isGifUrl(url)) gifVid.push({ u: url });
+        else addImg(url);
     }
 
     const isOwn = authorId === UserStore.getCurrentUser()?.id;
@@ -791,11 +842,8 @@ function makePlaceholder(title?: string, reveal?: RevealSource, dims?: Placehold
 }
 
 function refreshPlaceholders() {
-    for (const el of document.querySelectorAll<HTMLElement>(`[${HIDDEN_ATTR}]`)) {
-        const next = el.nextElementSibling;
-        if (next?.classList.contains(PLACEHOLDER_CLASS)) next.remove();
-        el.removeAttribute(HIDDEN_ATTR);
-    }
+    for (const el of document.querySelectorAll<HTMLElement>(`[${HIDDEN_ATTR}]`))
+        showMessageMedia(el);
     for (const el of document.querySelectorAll(`.${PLACEHOLDER_CLASS}`)) el.remove();
     scanMessages();
 }
@@ -813,29 +861,165 @@ async function loadPlaceholderImage(rescan = true) {
     if (rescan) refreshPlaceholders();
 }
 
+function getMosaicItems(messageEl: HTMLElement): Array<{ cell: HTMLElement; media: HTMLElement; }> {
+    const cellSelector = "[class*='mosaicItem'],[class*='visualMediaItemContainer'],[class*='imageWrapper']";
+    const items = new Map<HTMLElement, HTMLElement>();
+
+    for (const media of messageEl.querySelectorAll<HTMLElement>("img,video")) {
+        if (media.closest(`.${PLACEHOLDER_CLASS}`)) continue;
+        const cell = media.closest<HTMLElement>(cellSelector);
+        if (!cell || !messageEl.contains(cell) || items.has(cell)) continue;
+        items.set(cell, media);
+    }
+
+    return [...items].map(([cell, media]) => ({ cell, media }));
+}
+
+function restoreMosaicItem(cell: HTMLElement, media: HTMLElement) {
+    cell.querySelector(`[${MOSAIC_PLACEHOLDER_ATTR}]`)?.remove();
+
+    if (media.hasAttribute(MOSAIC_MEDIA_ATTR)) {
+        media.style.visibility = media.getAttribute(MOSAIC_VISIBILITY_ATTR) || "";
+        media.removeAttribute(MOSAIC_VISIBILITY_ATTR);
+        media.removeAttribute(MOSAIC_MEDIA_ATTR);
+    }
+
+    if (cell.hasAttribute(MOSAIC_POSITION_ATTR)) {
+        cell.style.position = cell.getAttribute(MOSAIC_POSITION_ATTR) || "";
+        cell.removeAttribute(MOSAIC_POSITION_ATTR);
+    }
+}
+
+function getMosaicItemUrls(message: any, media: HTMLElement, index: number): string[] {
+    const src = (media as HTMLImageElement).currentSrc
+        || (media as HTMLImageElement).src
+        || media.getAttribute("src")
+        || "";
+    const attachments = [...(message?.attachments ?? [])];
+    const canonicalSrc = src ? cleanUrl(src) : "";
+    const attachment = attachments.find(att =>
+        getAttachmentUrls(att).some(url => cleanUrl(url) === canonicalSrc)
+    ) ?? attachments[index];
+
+    return [...new Set([src, ...getAttachmentUrls(attachment)].filter(Boolean))];
+}
+
+function hideMosaicMedia(messageEl: HTMLElement, message: any): boolean {
+    if ((message?.attachments?.length ?? 0) < 2) return false;
+
+    const items = getMosaicItems(messageEl)
+        .map(item => ({ ...item, rect: item.cell.getBoundingClientRect() }))
+        .filter(item => item.rect.width >= 1 && item.rect.height >= 1);
+    if (items.length < 2) return false;
+
+    const channelId = message.channel_id ?? message.channelId;
+    const isOwn = message.author?.id === UserStore.getCurrentUser()?.id;
+    let hiddenCount = 0;
+
+    for (const [index, { cell, media, rect }] of items.entries()) {
+        const urls = getMosaicItemUrls(message, media, index)
+            .filter(url => !skipOwnImage(url, isOwn));
+        if (!channelId || !isMediaBlocked(channelId, urls)) {
+            restoreMosaicItem(cell, media);
+            continue;
+        }
+
+        hiddenCount++;
+        const reveal = getDomRevealMedia(media);
+        const existing = cell.querySelector<HTMLElement>(`[${MOSAIC_PLACEHOLDER_ATTR}]`);
+        const needsCurtain = !!existing
+            && settings.store.dragToPeek
+            && !existing.classList.contains(CURTAIN_CLASS);
+
+        if (!media.hasAttribute(MOSAIC_MEDIA_ATTR)) {
+            media.setAttribute(MOSAIC_MEDIA_ATTR, "");
+            media.setAttribute(MOSAIC_VISIBILITY_ATTR, media.style.visibility);
+            media.style.visibility = "hidden";
+        }
+
+        if (getComputedStyle(cell).position === "static") {
+            cell.setAttribute(MOSAIC_POSITION_ATTR, cell.style.position);
+            cell.style.position = "relative";
+        }
+
+        if (existing && (!needsCurtain || !reveal)) continue;
+        existing?.remove();
+
+        const src = (media as HTMLImageElement).currentSrc || (media as HTMLImageElement).src || media.getAttribute("src") || "";
+        const placeholder = makePlaceholder(src ? getMediaTitle(src) : undefined, reveal, {
+            w: Math.round(rect.width),
+            h: Math.round(rect.height)
+        });
+        placeholder.setAttribute(MOSAIC_PLACEHOLDER_ATTR, "");
+        placeholder.style.position = "absolute";
+        placeholder.style.inset = "0";
+        placeholder.style.width = "100%";
+        placeholder.style.height = "100%";
+        placeholder.style.zIndex = "1";
+        cell.appendChild(placeholder);
+    }
+
+    if (hiddenCount > 0) {
+        messageEl.setAttribute(HIDDEN_ATTR, "");
+        messageEl.setAttribute(MOSAIC_ATTR, "");
+    } else {
+        messageEl.removeAttribute(HIDDEN_ATTR);
+        messageEl.removeAttribute(MOSAIC_ATTR);
+    }
+
+    return hiddenCount > 0;
+}
+
 
 // mark the message because discord replaces image elements while scrolling
-function hideMessageMedia(messageEl: HTMLElement, message?: any) {
-    const hasPlaceholder = !!messageEl.querySelector(`.${PLACEHOLDER_CLASS}`);
-    const firstMedia     = hasPlaceholder ? null : messageEl.querySelector<HTMLElement>(MEDIA_SELECTORS);
+function hideMessageMedia(messageEl: HTMLElement, message?: any): boolean {
+    if ((message?.attachments?.length ?? 0) > 1) {
+        return hideMosaicMedia(messageEl, message);
+    }
 
-    const title  = !hasPlaceholder && message ? getPlaceholderTitle(message) : undefined;
-    const reveal = !hasPlaceholder && message
-        ? getRevealMedia(message) ?? (firstMedia ? getDomRevealMedia(firstMedia) : undefined)
-        : undefined;
+    const placeholder = messageEl.querySelector<HTMLElement>(`.${PLACEHOLDER_CLASS}`);
+    const needsCurtain = !!placeholder
+        && settings.store.dragToPeek
+        && !placeholder.classList.contains(CURTAIN_CLASS);
+    const firstMedia = messageEl.querySelector<HTMLElement>(MEDIA_SELECTORS);
+
+    const title = message ? getPlaceholderTitle(message) : undefined;
+    const messageReveal = message ? getRevealMedia(message) : undefined;
+    const domReveal = firstMedia ? getDomRevealMedia(firstMedia) : undefined;
+    const reveal = messageReveal && !messageReveal.nw && !messageReveal.nh && domReveal?.nw && domReveal?.nh
+        ? { ...messageReveal, nw: domReveal.nw, nh: domReveal.nh, poster: messageReveal.poster ?? domReveal.poster }
+        : messageReveal ?? domReveal;
     const nat    = reveal?.nw && reveal?.nh ? { w: reveal.nw, h: reveal.nh } : undefined;
-
-    const measured = firstMedia ? measureMedia(firstMedia, nat) : undefined;
+    const measured = !placeholder && firstMedia
+        ? measureMedia(firstMedia, nat)
+        : undefined;
 
     messageEl.setAttribute(HIDDEN_ATTR, "");
 
-    if (hasPlaceholder || !firstMedia) return;
+    if (!firstMedia) return false;
+    if (placeholder && !needsCurtain) return true;
+    if (needsCurtain && !reveal) return false;
+    placeholder?.remove();
     const dims = getPlaceholderSize(measured, reveal);
     firstMedia.insertAdjacentElement("afterend", makePlaceholder(title, reveal, dims));
+    return true;
 }
 
 function showMessageMedia(messageEl: HTMLElement) {
+    const next = messageEl.nextElementSibling;
+    if (next?.classList.contains(PLACEHOLDER_CLASS)) next.remove();
+
     messageEl.removeAttribute(HIDDEN_ATTR);
+    messageEl.removeAttribute(MOSAIC_ATTR);
+    for (const media of messageEl.querySelectorAll<HTMLElement>(`[${MOSAIC_MEDIA_ATTR}]`)) {
+        media.style.visibility = media.getAttribute(MOSAIC_VISIBILITY_ATTR) || "";
+        media.removeAttribute(MOSAIC_VISIBILITY_ATTR);
+        media.removeAttribute(MOSAIC_MEDIA_ATTR);
+    }
+    for (const cell of messageEl.querySelectorAll<HTMLElement>(`[${MOSAIC_POSITION_ATTR}]`)) {
+        cell.style.position = cell.getAttribute(MOSAIC_POSITION_ATTR) || "";
+        cell.removeAttribute(MOSAIC_POSITION_ATTR);
+    }
     for (const ph of messageEl.querySelectorAll(`.${PLACEHOLDER_CLASS}`)) ph.remove();
 }
 
@@ -907,7 +1091,7 @@ function checkMessage(messageEl: HTMLElement, allowUnhide = false): boolean {
         return false;
     }
     if (hasBlockedMedia(message)) {
-        hideMessageMedia(messageEl, message);
+        if (!hideMessageMedia(messageEl, message)) return false;
         log("HIDE", message.id);
     } else {
         if (DEBUG) {
@@ -933,7 +1117,7 @@ function checkMessage(messageEl: HTMLElement, allowUnhide = false): boolean {
 function checkMessageSoon(messageEl: HTMLElement, attempt = 0) {
     if (!messageEl.isConnected) return;
     if (checkMessage(messageEl)) return;
-    if (attempt < 20) requestAnimationFrame(() => checkMessageSoon(messageEl, attempt + 1));
+    if (attempt < 120) requestAnimationFrame(() => checkMessageSoon(messageEl, attempt + 1));
 }
 
 function scanMessages() {
@@ -1026,17 +1210,13 @@ function checkMessageUpdate({ message }: any) {
     if (els.length === 0) return;
 
     for (const el of els) {
-        hideMessageMedia(el, message);
         let attempts = 0;
         const ensurePlaceholder = () => {
             if (!el.isConnected) return;
-            if (el.querySelector(EMBED_SELECTORS)) {
-                hideMessageMedia(el, message);
-            } else if (++attempts < 30) {
-                requestAnimationFrame(ensurePlaceholder);
-            }
+            if (hideMessageMedia(el, message)) return;
+            if (++attempts < 120) requestAnimationFrame(ensurePlaceholder);
         };
-        requestAnimationFrame(ensurePlaceholder);
+        ensurePlaceholder();
     }
 }
 
@@ -1062,7 +1242,7 @@ function watchSearchResults() {
                         for (const msg of group)
                             if (msg?.id) saveSearchMessage(msg.id, msg);
                     for (const el of document.querySelectorAll<HTMLElement>(`[data-list-item-id^='${NO_LIST_PREFIX}']`))
-                        checkMessage(el);
+                        checkMessageSoon(el);
                 } catch {}
             });
         }
@@ -1077,34 +1257,101 @@ function stopWatchingSearch() {
 }
 
 // right click menu
+function getContextAttachment(message: any, props: any): { url: string; urls: string[]; } | undefined {
+    const clickedUrls = [props?.src, props?.itemHref, props?.itemSrc, props?.itemSafeSrc]
+        .filter((url): url is string => !!url);
+    if (clickedUrls.length === 0) return undefined;
+
+    const clicked = new Set(clickedUrls.map(cleanUrl));
+    for (const attachment of message?.attachments ?? []) {
+        const urls = getAttachmentUrls(attachment);
+        if (urls.some(url => clicked.has(cleanUrl(url)))) {
+            return { url: attachment.url ?? attachment.proxy_url, urls };
+        }
+    }
+    return undefined;
+}
+
+function addContextItem(children: any[], item: React.ReactElement) {
+    const group = findGroupChildrenByChildId("copy-text", children)
+        ?? findGroupChildrenByChildId("copy-link", children)
+        ?? findGroupChildrenByChildId("copy-native-link", children);
+    if (group) group.push(item);
+    else children.push(item);
+}
+
 const messageContextPatch: NavContextMenuPatchCallback = (children, props) => {
     const message  = props?.message;
     const authorId = message?.author?.id;
     if (!authorId) return;
 
     const isOwn = authorId === UserStore.getCurrentUser()?.id;
-    const mediaUrls = getMediaUrls(message).filter(u => !skipOwnImage(u, isOwn));
+    const mediaUrls = getMediaUrls(message).filter(url => !skipOwnImage(url, isOwn));
     if (mediaUrls.length === 0) return;
 
     const channelId = message.channel_id ?? message.channelId;
     if (!channelId) return;
-    const blocked = isMediaBlocked(channelId, mediaUrls);
 
-    const menuItem = (
+    const target = getContextAttachment(message, props);
+    const targetUrls = target?.urls.filter(url => !skipOwnImage(url, isOwn)) ?? [];
+    const multipleAttachments = (message.attachments?.length ?? 0) > 1;
+
+    if (target && targetUrls.length > 0 && multipleAttachments) {
+        const targetBlocked = isMediaBlocked(channelId, targetUrls);
+        addContextItem(children, (
+            <Menu.MenuItem
+                id="vc-hide-media-single-toggle"
+                label={targetBlocked ? "Unhide this image" : "Hide this image"}
+                action={() => targetBlocked
+                    ? unblockMedia(channelId, targetUrls)
+                    : blockExactMedia(target.url)}
+            />
+        ));
+    }
+
+    const groups = [...(message.attachments ?? [])]
+        .map(getAttachmentUrls)
+        .map(urls => urls.filter(url => !skipOwnImage(url, isOwn)))
+        .filter(urls => urls.length > 0);
+    const allBlocked = groups.length > 0
+        ? groups.every(urls => isMediaBlocked(channelId, urls))
+        : isMediaBlocked(channelId, mediaUrls);
+    const allLabel = multipleAttachments
+        ? (allBlocked ? "Unhide all media" : "Hide all media")
+        : (allBlocked ? "Unhide this media" : "Hide this media");
+
+    addContextItem(children, (
         <Menu.MenuItem
-            id="vc-hide-gif-toggle"
-            label={blocked ? "Unhide this media" : "Hide this media"}
-            action={() => blocked ? unblockMedia(channelId, mediaUrls) : blockMedia(channelId, mediaUrls)}
+            id="vc-hide-media-all-toggle"
+            label={allLabel}
+            action={() => allBlocked
+                ? unblockMedia(channelId, mediaUrls)
+                : blockMedia(channelId, mediaUrls)}
         />
-    );
+    ));
+};
 
-    const group = findGroupChildrenByChildId("copy-text", children) ?? findGroupChildrenByChildId("copy-link", children);
-    if (group) group.push(menuItem);
-    else children.push(menuItem);
+const imageContextPatch: NavContextMenuPatchCallback = (children, props) => {
+    if (props?.message) {
+        messageContextPatch(children, props);
+        return;
+    }
+
+    const src = props?.src;
+    if (!src) return;
+    const blocked = blockedCanonicalUrls.has(cleanUrl(src));
+    addContextItem(children, (
+        <Menu.MenuItem
+            id="vc-hide-media-image-toggle"
+            label={blocked ? "Unhide this image" : "Hide this image"}
+            action={() => blocked ? unblockExactMedia(src) : blockExactMedia(src)}
+        />
+    ));
 };
 
 // start and stop
 let observer: MutationObserver | null = null;
+let startupRescanTimer: number | null = null;
 
 export default definePlugin({
     name: "HideMediaEverywhere",
@@ -1116,7 +1363,7 @@ export default definePlugin({
 
     start() {
         Vencord.Api.ContextMenu.addContextMenuPatch("message", messageContextPatch);
-        Vencord.Api.ContextMenu.addContextMenuPatch("image-context", messageContextPatch);
+        Vencord.Api.ContextMenu.addContextMenuPatch("image-context", imageContextPatch);
         loadBlockedMedia();
         cachedPlaceholderSrc = undefined;
         loadPlaceholderImage(false);
@@ -1124,7 +1371,7 @@ export default definePlugin({
         const style       = document.createElement("style");
         style.id          = STYLE_ID;
         style.textContent = `
-            [${HIDDEN_ATTR}] :is(${MEDIA_SELECTORS}) { display: none !important; }
+            [${HIDDEN_ATTR}]:not([${MOSAIC_ATTR}]) :is(${MEDIA_SELECTORS}) { display: none !important; }
             .${PLACEHOLDER_CLASS} { display: block; border-radius: 4px; }
             .${PLACEHOLDER_CLASS}:is(img) { width: 200px; height: auto; }
             .${PLACEHOLDER_CLASS}:is(div) { padding: 6px 10px; font-size: 12px; color: var(--text-muted); background: var(--background-secondary); width: fit-content; }
@@ -1147,13 +1394,19 @@ export default definePlugin({
         FluxDispatcher.subscribe("MESSAGE_EMBED_UPDATE", checkMessageUpdate);
 
         scanMessages();
+        startupRescanTimer = window.setTimeout(() => {
+            loadBlockedMedia();
+            scanMessages();
+        }, 1000);
     },
 
     stop() {
         Vencord.Api.ContextMenu.removeContextMenuPatch("message", messageContextPatch);
-        Vencord.Api.ContextMenu.removeContextMenuPatch("image-context", messageContextPatch);
+        Vencord.Api.ContextMenu.removeContextMenuPatch("image-context", imageContextPatch);
         observer?.disconnect();
         observer = null;
+        if (startupRescanTimer !== null) window.clearTimeout(startupRescanTimer);
+        startupRescanTimer = null;
 
         stopWatchingSearch();
         searchMessageCache.clear();
@@ -1167,7 +1420,7 @@ export default definePlugin({
         document.getElementById(STYLE_ID)?.remove();
 
         for (const el of document.querySelectorAll<HTMLElement>(`[${HIDDEN_ATTR}]`))
-            el.removeAttribute(HIDDEN_ATTR);
+            showMessageMedia(el);
         for (const el of document.querySelectorAll<HTMLElement>(`[${PREVIEW_HIDDEN_ATTR}]`)) {
             el.style.removeProperty("display");
             el.removeAttribute(PREVIEW_HIDDEN_ATTR);
