@@ -236,6 +236,7 @@ let blockedCanonicalUrls = new Set<string>();
 let blockedFileNames = new Set<string>();
 // hashes catch the same image even when Discord changes its URL
 let blockedHashes = new Set<string>();
+let allowedHashes = new Set<string>();
 let blockedHashFilters: Array<{ hash: string; size: number; width: number; height: number; }> = [];
 const mediaHashes = new Map<string, string>();
 const hashRequests = new Map<string, Promise<string | null>>();
@@ -247,6 +248,7 @@ function updateBlockedFiles() {
     blockedCanonicalUrls.clear();
     blockedFileNames.clear();
     blockedHashes.clear();
+    allowedHashes.clear();
     blockedHashFilters = [];
     activeBlockCount = 0;
     for (const key of blockedUrlCache) {
@@ -278,7 +280,11 @@ function updateBlockedFiles() {
         if (fileMatch) {
             activeBlockCount++;
             try { blockedFileNames.add(decodeURIComponent(fileMatch[1]).toLowerCase()); } catch {}
+            continue;
         }
+
+        const allowMatch = key.match(/^v4a:([a-f0-9]{64})$/i);
+        if (allowMatch) allowedHashes.add(allowMatch[1].toLowerCase());
     }
 }
 
@@ -414,6 +420,10 @@ function getHashFromBlockKey(key: string): string | undefined {
     return key.match(/^v4h:(?:\d+:\d+x\d+:)?([a-f0-9]{64})$/i)?.[1]?.toLowerCase();
 }
 
+function makeHashAllowKey(hash: string): string {
+    return `v4a:${hash}`;
+}
+
 // this keeps us from downloading every image just to compare hashes
 function couldMatchBlockedHash(attachment: any): boolean {
     const size = Number(attachment?.size) || 0;
@@ -433,8 +443,8 @@ function isMediaBlocked(urls: string[]): boolean {
         const fileName = getFileName(url).toLowerCase();
         const hash = mediaHashes.get(canon);
         return blockedCanonicalUrls.has(canon)
-            || blockedFileNames.has(fileName)
-            || !!hash && blockedHashes.has(hash);
+            || !!hash && blockedHashes.has(hash)
+            || blockedFileNames.has(fileName) && (!hash || !allowedHashes.has(hash));
     })) return true;
 
     return makeBlockKeys(urls).some(key => blockedUrlCache.has(key));
@@ -463,6 +473,7 @@ async function blockImageByContent(rawUrl: string, relatedUrls: string[], attach
     }
 
     const next = new Set(blockedUrlCache);
+    next.delete(makeHashAllowKey(hash));
     next.add(makeHashBlockKey(hash, attachment));
     saveBlockedMedia(next);
     scanMessages();
@@ -471,12 +482,16 @@ async function blockImageByContent(rawUrl: string, relatedUrls: string[], attach
 async function unblockImageByContent(rawUrl: string, relatedUrls: string[]) {
     const urls = [...new Set([rawUrl, ...relatedUrls])];
     const hash = await getAttachmentHash(urls);
-    unblockMedia(urls);
+    const preservedNames = hash
+        ? new Set(urls.map(url => getFileName(url).toLowerCase()).filter(name => blockedFileNames.has(name)))
+        : new Set<string>();
+    unblockMedia(urls, preservedNames);
     if (!hash) return;
 
     const next = new Set(blockedUrlCache);
     for (const key of next)
         if (getHashFromBlockKey(key) === hash) next.delete(key);
+    if (preservedNames.size > 0) next.add(makeHashAllowKey(hash));
     saveBlockedMedia(next);
     scanHiddenMessages();
 }
@@ -488,7 +503,7 @@ async function blockAttachmentGroup(attachments: any[]) {
         const primaryUrl = attachment.url ?? attachment.proxy_url;
         if (!primaryUrl) return undefined;
 
-        const isImage = attachment.content_type?.startsWith("image/") || urls.some(isImageUrl);
+        const isImage = attachment.content_type?.startsWith("image/") || urls.some(url => isImageUrl(url) || isGifUrl(url));
         const hash = isImage ? await getAttachmentHash(urls) : null;
         return hash ? makeHashBlockKey(hash, attachment) : makeSignatureKey([primaryUrl]);
     }));
@@ -506,13 +521,21 @@ async function unblockAttachmentGroup(attachments: any[]) {
             urls: getAttachmentUrls(attachment)
         }))
         .filter(group => group.urls.length > 0);
-    const allUrls = groups.flatMap(group => group.urls);
-    unblockMedia(allUrls);
-
     const hashes = await Promise.all(groups.map(group => {
-        const isImage = group.attachment.content_type?.startsWith("image/") || group.urls.some(isImageUrl);
+        const isImage = group.attachment.content_type?.startsWith("image/") || group.urls.some(url => isImageUrl(url) || isGifUrl(url));
         return isImage ? getAttachmentHash(group.urls) : null;
     }));
+    const preservedNames = new Set<string>();
+    groups.forEach((group, index) => {
+        if (!hashes[index]) return;
+        for (const url of group.urls) {
+            const name = getFileName(url).toLowerCase();
+            if (blockedFileNames.has(name)) preservedNames.add(name);
+        }
+    });
+    const allUrls = groups.flatMap(group => group.urls);
+    unblockMedia(allUrls, preservedNames);
+
     const blockedGroupHashes = new Set(hashes.filter((hash): hash is string => !!hash));
     if (blockedGroupHashes.size === 0) return;
 
@@ -521,11 +544,16 @@ async function unblockAttachmentGroup(attachments: any[]) {
         const hash = getHashFromBlockKey(key);
         if (hash && blockedGroupHashes.has(hash)) next.delete(key);
     }
+    groups.forEach((group, index) => {
+        const hash = hashes[index];
+        if (hash && group.urls.some(url => preservedNames.has(getFileName(url).toLowerCase())))
+            next.add(makeHashAllowKey(hash));
+    });
     saveBlockedMedia(next);
     scanHiddenMessages();
 }
 
-function unblockMedia(rawUrls: string[]) {
+function unblockMedia(rawUrls: string[], preservedFileNames = new Set<string>()) {
     const next = new Set(blockedUrlCache);
     for (const key of makeBlockKeys(rawUrls)) next.delete(key);
     const canonicalUrls = new Set(rawUrls.map(cleanUrl));
@@ -541,7 +569,10 @@ function unblockMedia(rawUrls: string[]) {
 
         const fileMatch = key.match(/^v4f:(.+)$/);
         if (fileMatch) {
-            try { if (fileNames.has(decodeURIComponent(fileMatch[1]).toLowerCase())) next.delete(key); } catch {}
+            try {
+                const name = decodeURIComponent(fileMatch[1]).toLowerCase();
+                if (fileNames.has(name) && !preservedFileNames.has(name)) next.delete(key);
+            } catch {}
             continue;
         }
 
@@ -581,18 +612,20 @@ function getAttachmentUrls(attachment: any): string[] {
 
 // only hash attachments that could match something already blocked
 function queueMessageHashes(message: any, messageEl: HTMLElement) {
-    if (blockedHashes.size === 0) return;
+    if (blockedHashes.size === 0 && allowedHashes.size === 0) return;
 
     for (const attachment of message?.attachments ?? []) {
         const urls = getAttachmentUrls(attachment);
         if (urls.length === 0) continue;
-        if (!attachment.content_type?.startsWith("image/") && !urls.some(isImageUrl)) continue;
+        if (!attachment.content_type?.startsWith("image/") && !urls.some(url => isImageUrl(url) || isGifUrl(url))) continue;
         if (urls.some(url => mediaHashes.has(cleanUrl(url)))) continue;
-        if (!couldMatchBlockedHash(attachment)) continue;
+        const needsAllowCheck = allowedHashes.size > 0
+            && urls.some(url => blockedFileNames.has(getFileName(url).toLowerCase()));
+        if (!needsAllowCheck && !couldMatchBlockedHash(attachment)) continue;
 
         void getAttachmentHash(urls).then(hash => {
-            if (hash && blockedHashes.has(hash) && messageEl.isConnected)
-                checkMessageSoon(messageEl);
+            if (hash && (blockedHashes.has(hash) || allowedHashes.has(hash)) && messageEl.isConnected)
+                checkMessage(messageEl, true);
         });
     }
 }
