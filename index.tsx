@@ -127,7 +127,6 @@ const NO_LIST_PREFIX  = "NO_LIST___";
 
 const ALL_MSG_SELECTOR   = `[data-list-item-id^='${CHAT_MSG_PREFIX}'],[data-list-item-id^='${NO_LIST_PREFIX}']`;
 const MEDIA_SELECTORS    = "[class*='embed'],[class*='imageWrapper'],[class*='mediaAttachmentsContainer'],[class*='visualMediaItemContainer'],[class*='oneByOneGrid'],[class*='mosaicItem'],[class*='attachment']";
-const TITLE_MEDIA_SELECTOR = 'img,video,[data-role="img"],[role="img"]';
 const EMBED_SELECTORS    = "[class*='embed'],[class*='imageWrapper'],[class*='mediaAttachmentsContainer'],[class*='visualMediaItemContainer']";
 const DIALOG_SELECTOR    = '[role="dialog"],[role="alertdialog"]';
 const PREVIEW_DIALOG_SELECTOR = '[role="alertdialog"],[role="dialog"][data-dialog="modal"]';
@@ -714,7 +713,7 @@ function getMediaTitle(src: string): string {
     }
 }
 
-function getMessageMediaTitle(message: any): string | undefined {
+function getPlaceholderTitle(message: any): string | undefined {
     const candidates: string[] = [];
     for (const att of message?.attachments ?? []) {
         const u = att.url || att.proxy_url;
@@ -725,11 +724,9 @@ function getMessageMediaTitle(message: any): string | undefined {
         if (u) candidates.push(u);
     }
 
-    return candidates[0] && getMediaTitle(candidates[0]);
-}
-
-function getPlaceholderTitle(message: any): string | undefined {
-    return isMediaBlocked(getMediaUrls(message)) ? getMessageMediaTitle(message) : undefined;
+    return isMediaBlocked(getMediaUrls(message))
+        ? candidates[0] && getMediaTitle(candidates[0])
+        : undefined;
 }
 
 interface RevealSource { src: string; kind: "image" | "gif" | "video"; nw?: number; nh?: number; poster?: string; }
@@ -1088,9 +1085,7 @@ function getMosaicItems(messageEl: HTMLElement, attachmentCount: number): Array<
 }
 
 function restoreMosaicItem(cell: HTMLElement, media: HTMLElement) {
-    const placeholder = cell.querySelector<HTMLElement>(`[${MOSAIC_PLACEHOLDER_ATTR}]`);
-    if (placeholder?.title) media.title = placeholder.title;
-    placeholder?.remove();
+    cell.querySelector(`[${MOSAIC_PLACEHOLDER_ATTR}]`)?.remove();
 
     if (media.hasAttribute(MOSAIC_MEDIA_ATTR)) {
         media.style.visibility = media.getAttribute(MOSAIC_VISIBILITY_ATTR) || "";
@@ -1120,20 +1115,6 @@ function getMosaicItem(message: any, media: HTMLElement, index: number): { attac
         attachment,
         urls: [...new Set([src, ...getAttachmentUrls(attachment)].filter(Boolean))]
     };
-}
-
-function addVisibleMediaTitles(messageEl: HTMLElement, message: any) {
-    const title = getMessageMediaTitle(message);
-    if (!title) return;
-
-    const media = new Set<HTMLElement>();
-    for (const container of messageEl.querySelectorAll<HTMLElement>(MEDIA_SELECTORS)) {
-        if (container.matches(TITLE_MEDIA_SELECTOR)) media.add(container);
-        for (const el of container.querySelectorAll<HTMLElement>(TITLE_MEDIA_SELECTOR)) {
-            if (!el.closest(`.${PLACEHOLDER_CLASS}`)) media.add(el);
-        }
-    }
-    for (const el of media) if (!el.title) el.title = title;
 }
 
 // mosaics need a separate placeholder for each attachment
@@ -1254,13 +1235,7 @@ function showMessageMedia(messageEl: HTMLElement) {
         cell.style.position = cell.getAttribute(MOSAIC_POSITION_ATTR) || "";
         cell.removeAttribute(MOSAIC_POSITION_ATTR);
     }
-    for (const ph of messageEl.querySelectorAll<HTMLElement>(`.${PLACEHOLDER_CLASS}`)) {
-        const target = ph.hasAttribute(MOSAIC_PLACEHOLDER_ATTR)
-            ? ph.parentElement
-            : ph.previousElementSibling;
-        if (ph.title && target instanceof HTMLElement) target.title = ph.title;
-        ph.remove();
-    }
+    for (const ph of messageEl.querySelectorAll(`.${PLACEHOLDER_CLASS}`)) ph.remove();
 }
 
 // popup previews
@@ -1350,7 +1325,6 @@ function checkMessage(messageEl: HTMLElement, allowUnhide = false): boolean {
             showMessageMedia(messageEl);
             log("unhide", message.id);
         }
-        addVisibleMediaTitles(messageEl, message);
     }
     return true;
 }
@@ -1416,7 +1390,7 @@ function checkNewNodes(mutations: MutationRecord[]) {
             for (const el of node.querySelectorAll<HTMLElement>(ALL_MSG_SELECTOR))
                 if (!el.closest(DIALOG_SELECTOR)) toProcess.add(el);
 
-            if (node.matches(`${MEDIA_SELECTORS},${TITLE_MEDIA_SELECTOR}`) || node.querySelector(`${MEDIA_SELECTORS},${TITLE_MEDIA_SELECTOR}`)) {
+            if (node.matches(MEDIA_SELECTORS) || node.querySelector(MEDIA_SELECTORS)) {
                 const msgEl = node.closest<HTMLElement>(ALL_MSG_SELECTOR);
                 if (msgEl && !msgEl.closest(DIALOG_SELECTOR)) toProcess.add(msgEl);
             }
