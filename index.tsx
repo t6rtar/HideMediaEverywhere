@@ -1085,7 +1085,9 @@ function getMosaicItems(messageEl: HTMLElement, attachmentCount: number): Array<
 }
 
 function restoreMosaicItem(cell: HTMLElement, media: HTMLElement) {
-    cell.querySelector(`[${MOSAIC_PLACEHOLDER_ATTR}]`)?.remove();
+    const placeholder = cell.querySelector<HTMLElement>(`[${MOSAIC_PLACEHOLDER_ATTR}]`);
+    if (placeholder?.title) media.title = placeholder.title;
+    placeholder?.remove();
 
     if (media.hasAttribute(MOSAIC_MEDIA_ATTR)) {
         media.style.visibility = media.getAttribute(MOSAIC_VISIBILITY_ATTR) || "";
@@ -1235,7 +1237,13 @@ function showMessageMedia(messageEl: HTMLElement) {
         cell.style.position = cell.getAttribute(MOSAIC_POSITION_ATTR) || "";
         cell.removeAttribute(MOSAIC_POSITION_ATTR);
     }
-    for (const ph of messageEl.querySelectorAll(`.${PLACEHOLDER_CLASS}`)) ph.remove();
+    for (const ph of messageEl.querySelectorAll<HTMLElement>(`.${PLACEHOLDER_CLASS}`)) {
+        const target = ph.hasAttribute(MOSAIC_PLACEHOLDER_ATTR)
+            ? ph.parentElement
+            : ph.previousElementSibling;
+        if (ph.title && target instanceof HTMLElement) target.title = ph.title;
+        ph.remove();
+    }
 }
 
 // popup previews
