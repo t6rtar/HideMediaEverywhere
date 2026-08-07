@@ -221,6 +221,11 @@ function isImageUrl(url: string): boolean {
     return IMAGE_EXT_RE.test(cleanUrl(url));
 }
 
+function isVideoFileAttachment(attachment: any, urls: string[]): boolean {
+    return (attachment?.content_type?.startsWith("video/") || urls.some(isDirectVideoUrl))
+        && !urls.some(isGifUrl);
+}
+
 function makeSignatureKey(urls: string[]): string {
     const signature = [...new Set(urls.map(cleanUrl))].sort().join("\n");
     return `v4:${encodeURIComponent(signature)}`;
@@ -228,6 +233,10 @@ function makeSignatureKey(urls: string[]): string {
 
 function makeBlockKeys(urls: string[]): string[] {
     return [makeSignatureKey(urls)];
+}
+
+function makeFileNameBlockKey(url: string): string {
+    return `v4f:${encodeURIComponent(getFileName(url).toLowerCase())}`;
 }
 
 // avoids splitting the settings string for every image
@@ -324,10 +333,19 @@ function loadBlockedMedia() {
         }
     };
     // channel image keys became obsolete when images moved to content hashes
-    blockedUrlCache = removeCoveredBlockKeys(new Set(raw
+    const migrated = new Set(raw
         .filter(key => !invalidTenorKeys.has(key.toLowerCase()) && !key.startsWith("v4i:"))
         .map(cleanSavedKey)
-        .filter((key): key is string => !!key)));
+        .filter((key): key is string => !!key));
+    for (const key of migrated) {
+        const hash = getHashFromBlockKey(key);
+        if (!hash) continue;
+        for (const [url, cachedHash] of mediaHashes) {
+            if (cachedHash === hash && isDirectVideoUrl(url) && !isGifUrl(url))
+                migrated.add(makeFileNameBlockKey(url));
+        }
+    }
+    blockedUrlCache = removeCoveredBlockKeys(migrated);
     const joined = [...blockedUrlCache].join(",");
     if (joined !== settings.store.blockedUrls) settings.store.blockedUrls = joined;
     updateBlockedFiles();
@@ -457,43 +475,65 @@ function blockMedia(rawUrls: string[]) {
     scanMessages();
 }
 
-function blockExactMedia(rawUrl: string) {
-    const next = new Set(blockedUrlCache);
-    next.add(makeSignatureKey([rawUrl]));
-    saveBlockedMedia(next);
-    scanMessages();
-}
-
 async function blockImageByContent(rawUrl: string, relatedUrls: string[], attachment?: any) {
     const urls = [...new Set([rawUrl, ...relatedUrls])];
+    const videoNameKey = isVideoFileAttachment(attachment, urls) ? makeFileNameBlockKey(rawUrl) : undefined;
     const hash = await getAttachmentHash(urls);
     if (!hash) {
-        blockExactMedia(rawUrl);
+        const next = new Set(blockedUrlCache);
+        next.add(makeSignatureKey([rawUrl]));
+        if (videoNameKey) next.add(videoNameKey);
+        saveBlockedMedia(next);
+        scanMessages();
         return;
     }
 
     const next = new Set(blockedUrlCache);
     next.delete(makeHashAllowKey(hash));
     next.add(makeHashBlockKey(hash, attachment));
+    if (videoNameKey) next.add(videoNameKey);
     saveBlockedMedia(next);
     scanMessages();
+}
+
+function getCachedHashesForFileNames(fileNames: Set<string>): Set<string> {
+    const hashes = new Set<string>();
+    for (const [url, hash] of mediaHashes)
+        if (fileNames.has(getFileName(url).toLowerCase())) hashes.add(hash);
+    return hashes;
 }
 
 async function unblockImageByContent(rawUrl: string, relatedUrls: string[]) {
     const urls = [...new Set([rawUrl, ...relatedUrls])];
     const hash = await getAttachmentHash(urls);
-    const preservedNames = hash
+    const isVideo = isVideoFileAttachment(undefined, urls);
+    const videoFileNames = isVideo
+        ? new Set(urls.map(url => getFileName(url).toLowerCase()))
+        : new Set<string>();
+    const hashesToRemove = getCachedHashesForFileNames(videoFileNames);
+    if (hash) hashesToRemove.add(hash);
+    const preservedNames = hash && !isVideo
         ? new Set(urls.map(url => getFileName(url).toLowerCase()).filter(name => blockedFileNames.has(name)))
         : new Set<string>();
     unblockMedia(urls, preservedNames);
-    if (!hash) return;
+    if (hashesToRemove.size === 0) return;
 
     const next = new Set(blockedUrlCache);
-    for (const key of next)
-        if (getHashFromBlockKey(key) === hash) next.delete(key);
-    if (preservedNames.size > 0) next.add(makeHashAllowKey(hash));
+    for (const key of next) {
+        const blockHash = getHashFromBlockKey(key);
+        const allowHash = key.match(/^v4a:([a-f0-9]{64})$/i)?.[1]?.toLowerCase();
+        if (blockHash && hashesToRemove.has(blockHash)) next.delete(key);
+        else if (isVideo && allowHash && hashesToRemove.has(allowHash)) next.delete(key);
+    }
+    if (hash && preservedNames.size > 0) next.add(makeHashAllowKey(hash));
     saveBlockedMedia(next);
     scanHiddenMessages();
+}
+
+function isHashableAttachment(attachment: any, urls: string[]): boolean {
+    return attachment.content_type?.startsWith("image/")
+        || urls.some(url => isImageUrl(url) || isGifUrl(url))
+        || isVideoFileAttachment(attachment, urls);
 }
 
 async function blockAttachmentGroup(attachments: any[]) {
@@ -503,13 +543,18 @@ async function blockAttachmentGroup(attachments: any[]) {
         const primaryUrl = attachment.url ?? attachment.proxy_url;
         if (!primaryUrl) return undefined;
 
-        const isImage = attachment.content_type?.startsWith("image/") || urls.some(url => isImageUrl(url) || isGifUrl(url));
-        const hash = isImage ? await getAttachmentHash(urls) : null;
-        return hash ? makeHashBlockKey(hash, attachment) : makeSignatureKey([primaryUrl]);
+        const hash = isHashableAttachment(attachment, urls) ? await getAttachmentHash(urls) : null;
+        return [
+            hash ? makeHashBlockKey(hash, attachment) : makeSignatureKey([primaryUrl]),
+            ...(isVideoFileAttachment(attachment, urls) ? [makeFileNameBlockKey(primaryUrl)] : [])
+        ];
     }));
 
     const next = new Set(blockedUrlCache);
-    for (const key of blocks) if (key) next.add(key);
+    for (const keys of blocks) {
+        if (!keys) continue;
+        for (const key of keys) next.add(key);
+    }
     saveBlockedMedia(next);
     scanMessages();
 }
@@ -522,31 +567,39 @@ async function unblockAttachmentGroup(attachments: any[]) {
         }))
         .filter(group => group.urls.length > 0);
     const hashes = await Promise.all(groups.map(group => {
-        const isImage = group.attachment.content_type?.startsWith("image/") || group.urls.some(url => isImageUrl(url) || isGifUrl(url));
-        return isImage ? getAttachmentHash(group.urls) : null;
+        return isHashableAttachment(group.attachment, group.urls) ? getAttachmentHash(group.urls) : null;
     }));
+    const videoFileNames = new Set<string>();
+    for (const group of groups) {
+        if (!isVideoFileAttachment(group.attachment, group.urls)) continue;
+        for (const url of group.urls) videoFileNames.add(getFileName(url).toLowerCase());
+    }
     const preservedNames = new Set<string>();
     groups.forEach((group, index) => {
         if (!hashes[index]) return;
         for (const url of group.urls) {
             const name = getFileName(url).toLowerCase();
-            if (blockedFileNames.has(name)) preservedNames.add(name);
+            if (!videoFileNames.has(name) && blockedFileNames.has(name)) preservedNames.add(name);
         }
     });
     const allUrls = groups.flatMap(group => group.urls);
     unblockMedia(allUrls, preservedNames);
 
     const blockedGroupHashes = new Set(hashes.filter((hash): hash is string => !!hash));
+    for (const hash of getCachedHashesForFileNames(videoFileNames)) blockedGroupHashes.add(hash);
     if (blockedGroupHashes.size === 0) return;
 
     const next = new Set(blockedUrlCache);
     for (const key of next) {
         const hash = getHashFromBlockKey(key);
+        const allowHash = key.match(/^v4a:([a-f0-9]{64})$/i)?.[1]?.toLowerCase();
         if (hash && blockedGroupHashes.has(hash)) next.delete(key);
+        else if (allowHash && blockedGroupHashes.has(allowHash)) next.delete(key);
     }
     groups.forEach((group, index) => {
         const hash = hashes[index];
-        if (hash && group.urls.some(url => preservedNames.has(getFileName(url).toLowerCase())))
+        if (hash && !isVideoFileAttachment(group.attachment, group.urls)
+            && group.urls.some(url => preservedNames.has(getFileName(url).toLowerCase())))
             next.add(makeHashAllowKey(hash));
     });
     saveBlockedMedia(next);
@@ -617,7 +670,7 @@ function queueMessageHashes(message: any, messageEl: HTMLElement) {
     for (const attachment of message?.attachments ?? []) {
         const urls = getAttachmentUrls(attachment);
         if (urls.length === 0) continue;
-        if (!attachment.content_type?.startsWith("image/") && !urls.some(url => isImageUrl(url) || isGifUrl(url))) continue;
+        if (!isHashableAttachment(attachment, urls)) continue;
         if (urls.some(url => mediaHashes.has(cleanUrl(url)))) continue;
         const needsAllowCheck = allowedHashes.size > 0
             && urls.some(url => blockedFileNames.has(getFileName(url).toLowerCase()));
