@@ -47,6 +47,12 @@ const settings = definePluginSettings({
         description: "Play GIFs automatically while peeking.",
         default: true
     },
+    showMediaFilename: {
+        type: OptionType.BOOLEAN,
+        description: "Show the original filename or URL when hovering over hidden media. Requires ImageFilename.",
+        default: true,
+        onChange: refreshPlaceholders
+    },
     placeholderUrl: {
         type: OptionType.STRING,
         description: "Custom placeholder image data.",
@@ -754,7 +760,8 @@ function showFullUrl(): boolean {
     }
 }
 
-function getMediaTitle(src: string): string {
+function getMediaTitle(src: string): string | undefined {
+    if (!settings.store.showMediaFilename) return undefined;
     try {
         const url   = new URL(src);
         const isGif = IF_GIF_HOST_RE.test(url.hostname);
@@ -1658,6 +1665,7 @@ export default definePlugin({
     name: "HideMediaEverywhere",
     description: "Hide specific images, GIFs, and videos from the message context menu.",
     authors: [{ name: "t6rtar", id: 738215409559404562n }],
+    dependencies: ["ImageFilename"],
 
     settings,
     tags: ["Media", "Privacy", "Utility"],
